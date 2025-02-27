@@ -2,11 +2,12 @@
 
 ## 설명
 
-DEV 서버 비용을 줄이고자 도입된 DEV 관리자 봇
+DEV 서버 비용을 줄이고자 도입된 DEV 관리자 봇 <br/>
+[DEV 관리자 사용 가이드](https://www.notion.so/snorose/DEV-1a67ef0aa3bf8028bafff38536852086?pvs=4)
 
 - python 3.13 - flask 사용
 - AWS CDK 배포
-[노션 DEV 관리자 사용 가이드](https://www.notion.so/snorose/DEV-1a67ef0aa3bf8028bafff38536852086?pvs=4)
+
 
 ## 명령어 소개
 
