@@ -1,0 +1,11 @@
+- name: hello
+  description: Say hello!
+
+- name: start_dev
+  description: Getting Started the dev Server
+
+- name: stop_dev
+  description: Shutting down the dev server
+
+- name: status_dev
+  description: checking dev server status
