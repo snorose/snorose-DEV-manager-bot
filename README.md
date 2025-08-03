@@ -53,3 +53,4 @@ DEV 서버의 상태를 조회하는 명령어입니다.
 4. ```cdk bootstrap --region ap-northeast-2```를 입력해 CDK 부트스트랩 명령어를 실행합니다.
 5. ```cdk deploy```를 입력하여 lambda로 배포합니다.
 6. 배포가 성공했다면 출력된 url을 [디스코드 개발자 포털](https://discord.com/developers/applications)에서 봇을 선택하여 들어간 뒤, General Information > Interactions Endpoint URL에 입력합니다.
+7. 배포 뒤 Lambda에 EC2 인스턴스 조회 및 시작, 종료 권한을 부여합니다.
