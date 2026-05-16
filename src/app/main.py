@@ -12,7 +12,7 @@ DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
-handler = Mangum(asgi_app)
+handler = Mangum(asgi_app, lifespan="off")
 
 ROLE_MAPPING = {
     "프론트엔드": "1223647596728553602",
