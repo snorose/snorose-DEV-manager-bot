@@ -1,4 +1,6 @@
 import os
+import urllib.request
+import urllib.error
 import boto3
 from flask import Flask, jsonify, request
 from mangum import Mangum
@@ -9,6 +11,7 @@ AWS_REGION = "ap-northeast-2"
 INSTANCE_NAME = "snorose-dev"
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
+DEV_SERVER_HEALTH_URL = os.environ.get("DEV_SERVER_HEALTH_URL")  # e.g. http://<ip>:8080/actuator/health
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
@@ -122,12 +125,37 @@ def handle_stop_dev(user_roles):
     return stop_msg
 
 
+def check_app_health():
+    if not DEV_SERVER_HEALTH_URL:
+        return None
+    try:
+        req = urllib.request.urlopen(DEV_SERVER_HEALTH_URL, timeout=5)
+        if req.status == 200:
+            return "✅ 애플리케이션 응답 정상"
+        return f"⚠️ 애플리케이션 응답 이상 (HTTP {req.status})"
+    except urllib.error.URLError as e:
+        return f"❌ 애플리케이션 네트워크 오류: {e.reason}"
+    except Exception as e:
+        return f"❌ 애플리케이션 상태 확인 실패: {str(e)}"
+
+
 def handle_status_dev():
     instance_state = get_instance_state()
     instance_status = get_instance_status()
 
+    if instance_state == "running":
+        app_health = check_app_health()
+        is_initializing = "진행 중" in instance_status
+        has_app_error = app_health and "❌" in app_health
+
+        prefix = "⚠️" if (is_initializing or has_app_error) else "✅"
+        msg = f"{prefix} DEV 서버가 실행 중입니다.\n{instance_status}"
+        if app_health:
+            msg += f"\n{app_health}"
+        msg += f"\n테스트 중인 팀: {', '.join(active_teams) if active_teams else '없음'}"
+        return msg
+
     status_messages = {
-        "running": f"✅ DEV 서버가 실행 중입니다.\n{instance_status}\n테스트 중인 팀: {', '.join(active_teams) if active_teams else '없음'}",
         "stopped": "❌ DEV 서버가 중지되었습니다.",
         "pending": "⏳ DEV 서버가 시작 중입니다...",
         "stopping": "⏳ DEV 서버가 중지 중입니다...",
