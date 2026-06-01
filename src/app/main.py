@@ -1,7 +1,8 @@
 import os
+import json
 import urllib.request
 import urllib.error
-import boto3
+from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from mangum import Mangum
 from asgiref.wsgi import WsgiToAsgi
@@ -13,6 +14,8 @@ INSTANCE_NAME = "snorose-dev"
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
 DEV_SERVER_HEALTH_PORT = os.environ.get("DEV_SERVER_HEALTH_PORT", "8081")
 DEV_SERVER_HEALTH_PATH = os.environ.get("DEV_SERVER_HEALTH_PATH", "/actuator/health")
+ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-bucket")
+ACTIVE_TEAMS_KEY = os.environ.get("ACTIVE_TEAMS_KEY", "dev-manager/active-teams.json")
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
@@ -28,9 +31,12 @@ ROLE_MAPPING = {
     "디자인팀": "1259752818936385556",
 }
 
-# DEV 서버 사용 중인 팀 목록
-active_teams = set()
 ec2_client = None
+s3_client = None
+
+
+class ActiveTeamsStateError(Exception):
+    pass
 
 
 def get_ec2_client():
@@ -41,6 +47,63 @@ def get_ec2_client():
 
         ec2_client = boto3.client("ec2", region_name=AWS_REGION)
     return ec2_client
+
+
+def get_s3_client():
+    global s3_client
+
+    if s3_client is None:
+        import boto3
+
+        s3_client = boto3.client("s3", region_name=AWS_REGION)
+    return s3_client
+
+
+def normalize_active_teams(teams):
+    normalized = []
+    for team in teams:
+        if team and team not in normalized:
+            normalized.append(team)
+    return normalized
+
+
+def is_missing_s3_object_error(error):
+    error_code = getattr(error, "response", {}).get("Error", {}).get("Code")
+    return error_code in {"NoSuchKey", "NoSuchBucket"} or error.__class__.__name__ == "NoSuchKey"
+
+
+def load_active_teams():
+    try:
+        response = get_s3_client().get_object(
+            Bucket=ACTIVE_TEAMS_BUCKET,
+            Key=ACTIVE_TEAMS_KEY,
+        )
+        body = response["Body"].read().decode("utf-8")
+        if not body.strip():
+            return []
+        payload = json.loads(body)
+        return normalize_active_teams(payload.get("active_teams", []))
+    except Exception as e:
+        if is_missing_s3_object_error(e):
+            return []
+        raise ActiveTeamsStateError(f"활성 팀 상태 조회 오류: {e}") from e
+
+
+def save_active_teams(teams):
+    payload = {
+        "active_teams": normalize_active_teams(teams),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    get_s3_client().put_object(
+        Bucket=ACTIVE_TEAMS_BUCKET,
+        Key=ACTIVE_TEAMS_KEY,
+        Body=json.dumps(payload, ensure_ascii=False),
+        ContentType="application/json",
+    )
+
+
+def format_active_teams(teams):
+    return ", ".join(teams) if teams else "없음"
 
 
 def get_instance_id_by_name(instance_name):
@@ -100,10 +163,13 @@ def get_instance_status():
     
 
 def handle_start_dev(user_roles):
-    global active_teams
-
     if not user_roles:
         return "❌ DEV 서버를 시작할 권한이 없습니다."
+
+    try:
+        active_teams = load_active_teams()
+    except ActiveTeamsStateError as e:
+        return f"❌ {str(e)}"
 
     if not active_teams:
         start_msg = start_instance()
@@ -112,21 +178,31 @@ def handle_start_dev(user_roles):
 
     added_roles = [role for role in user_roles if role not in active_teams]
     if added_roles:
-        active_teams.update(added_roles)
-        return f"{start_msg}\n테스트 중인 팀: {', '.join(active_teams)}"
+        active_teams = normalize_active_teams(active_teams + added_roles)
+        try:
+            save_active_teams(active_teams)
+        except Exception as e:
+            return f"❌ 활성 팀 상태 저장 오류: {str(e)}"
+        return f"{start_msg}\n테스트 중인 팀: {format_active_teams(active_teams)}"
     return start_msg
 
 
 def handle_stop_dev(user_roles):
-    global active_teams
-
     if not user_roles:
         return "❌ DEV 서버를 중지할 권한이 없습니다."
 
+    try:
+        active_teams = load_active_teams()
+    except ActiveTeamsStateError as e:
+        return f"❌ {str(e)}"
+
     removed_roles = [role for role in user_roles if role in active_teams]
     if removed_roles:
-        for role in removed_roles:
-            active_teams.remove(role)
+        active_teams = [role for role in active_teams if role not in removed_roles]
+        try:
+            save_active_teams(active_teams)
+        except Exception as e:
+            return f"❌ 활성 팀 상태 저장 오류: {str(e)}"
         stop_msg = f"🚫 {', '.join(removed_roles)} 팀이 테스트를 종료했습니다."
     else:
         stop_msg = "⚠️ 이미 해당 팀은 테스트 중이 아닙니다."
@@ -141,7 +217,7 @@ def get_instance_public_ip():
     if not instance_id:
         return None
     try:
-        response = ec2_client.describe_instances(InstanceIds=[instance_id])
+        response = get_ec2_client().describe_instances(InstanceIds=[instance_id])
         return response["Reservations"][0]["Instances"][0].get("PublicIpAddress")
     except Exception:
         return None
@@ -166,6 +242,10 @@ def check_app_health():
 def handle_status_dev():
     instance_state = get_instance_state()
     instance_status = get_instance_status()
+    try:
+        active_teams = load_active_teams()
+    except ActiveTeamsStateError as e:
+        return f"❌ {str(e)}"
 
     if instance_state == "running":
         app_health = check_app_health()
@@ -176,7 +256,7 @@ def handle_status_dev():
         msg = f"{prefix} DEV 서버가 실행 중입니다.\n{instance_status}"
         if app_health:
             msg += f"\n{app_health}"
-        msg += f"\n테스트 중인 팀: {', '.join(active_teams) if active_teams else '없음'}"
+        msg += f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
         return msg
 
     status_messages = {
