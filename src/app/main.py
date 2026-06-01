@@ -159,7 +159,7 @@ def stop_instance():
     except Exception as e:
         return f"서버 중지 실패: {str(e)}"
 
-# @app.route("/interactions", methods=["POST"])
+@app.route("/interactions", methods=["POST"])
 @app.route("/", methods=["POST"])
 async def interactions():
     print(f"👉 Request: {request.json}")
