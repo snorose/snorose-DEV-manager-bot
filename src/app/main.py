@@ -30,12 +30,22 @@ ROLE_MAPPING = {
 
 # DEV 서버 사용 중인 팀 목록
 active_teams = set()
-ec2_client = boto3.client("ec2", region_name=AWS_REGION)
+ec2_client = None
+
+
+def get_ec2_client():
+    global ec2_client
+
+    if ec2_client is None:
+        import boto3
+
+        ec2_client = boto3.client("ec2", region_name=AWS_REGION)
+    return ec2_client
 
 
 def get_instance_id_by_name(instance_name):
     try:
-        response = ec2_client.describe_instances(
+        response = get_ec2_client().describe_instances(
             Filters=[{"Name": "tag:Name", "Values": [instance_name]}]
         )
         instances = response.get("Reservations", [])
@@ -57,7 +67,7 @@ def get_instance_state():
         return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
 
     try:
-        response = ec2_client.describe_instances(InstanceIds=[instance_id])
+        response = get_ec2_client().describe_instances(InstanceIds=[instance_id])
         state = response["Reservations"][0]["Instances"][0]["State"]["Name"]
         return state
     except Exception as e:
@@ -71,7 +81,7 @@ def get_instance_status():
         return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
 
     try:
-        response = ec2_client.describe_instance_status(InstanceIds=[instance_id])
+        response = get_ec2_client().describe_instance_status(InstanceIds=[instance_id])
         if not response["InstanceStatuses"]:
             return "⚠️ 상태 검사 정보를 가져올 수 없습니다."
 
@@ -184,7 +194,7 @@ def start_instance():
         return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
 
     try:
-        ec2_client.start_instances(InstanceIds=[instance_id])
+        get_ec2_client().start_instances(InstanceIds=[instance_id])
         return "🚀 서버를 시작 중입니다... (잠시 후 `status_dev`로 확인하세요)"
     except Exception as e:
         return f"서버 시작 실패: {str(e)}"
@@ -196,7 +206,7 @@ def stop_instance():
         return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
 
     try:
-        ec2_client.stop_instances(InstanceIds=[instance_id])
+        get_ec2_client().stop_instances(InstanceIds=[instance_id])
         return "🛑 서버를 중지 중입니다..."
     except Exception as e:
         return f"서버 중지 실패: {str(e)}"
