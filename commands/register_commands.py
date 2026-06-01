@@ -1,18 +1,42 @@
+import os
+from pathlib import Path
+
 import requests
 import yaml
 
-TOKEN = "MTM0MjcyMzg4ODM2NjQ4OTY3MA.GFiTUk.b6TUzaEWlEvMLdkCJan4TcDJNwRXEOyHARWXRk"
-APPLICATION_ID = "1342723888366489670"
-URL = f"https://discord.com/api/v9/applications/{APPLICATION_ID}/commands"
 
-with open("discord_commands.yaml", "r") as file:
-    yaml_content = file.read()
+API_VERSION = "v9"
+COMMANDS_FILE = Path(__file__).with_name("discord_commands.yaml")
 
-commands = yaml.safe_load(yaml_content)
-headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
 
-# Send the POST request for each command
-for command in commands:
-    response = requests.post(URL, json=command, headers=headers)
-    command_name = command["name"]
-    print(f"Command {command_name} created: {response.status_code}")
+def get_required_env(name):
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} environment variable is required.")
+    return value
+
+
+def load_commands(path=COMMANDS_FILE):
+    with path.open("r") as file:
+        return yaml.safe_load(file)
+
+
+def register_commands(token, application_id, commands):
+    url = f"https://discord.com/api/{API_VERSION}/applications/{application_id}/commands"
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+
+    for command in commands:
+        response = requests.post(url, json=command, headers=headers)
+        command_name = command["name"]
+        print(f"Command {command_name} created: {response.status_code}")
+        response.raise_for_status()
+
+
+def main():
+    token = get_required_env("DISCORD_BOT_TOKEN")
+    application_id = get_required_env("DISCORD_APPLICATION_ID")
+    register_commands(token, application_id, load_commands())
+
+
+if __name__ == "__main__":
+    main()
