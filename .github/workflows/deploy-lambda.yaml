@@ -69,3 +69,12 @@ jobs:
           --environment "Variables={ \
             DISCORD_PUBLIC_KEY=${{ vars.DISCORD_PUBLIC_KEY }} \
           }"
+
+    # Discord slash command registration
+    - name: Register Discord slash commands
+      env:
+        DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        DISCORD_APPLICATION_ID: ${{ vars.DISCORD_APPLICATION_ID }}
+      run: |
+        python -m pip install -r commands/requirements.txt
+        python commands/register_commands.py
