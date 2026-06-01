@@ -52,6 +52,14 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["data"]["content"], "DEV 관리자 업무 중입니다. version 0.1")
 
+    def test_main_import_does_not_initialize_boto3(self):
+        signing_key = SigningKey.generate()
+        sys.modules.pop("boto3", None)
+
+        import_main_with_public_key(signing_key.verify_key.encode().hex())
+
+        self.assertNotIn("boto3", sys.modules)
+
     def test_register_commands_does_not_hardcode_discord_bot_token(self):
         register_commands = PROJECT_ROOT / "commands" / "register_commands.py"
         source = register_commands.read_text()
