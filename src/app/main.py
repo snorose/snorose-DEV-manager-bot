@@ -1,7 +1,5 @@
 import os
 import json
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from mangum import Mangum
@@ -9,13 +7,19 @@ from asgiref.wsgi import WsgiToAsgi
 from discord_interactions import verify_key_decorator
 
 AWS_REGION = "ap-northeast-2"
-INSTANCE_NAME = "snorose-dev"
+
+# DEV 서버는 ASG(min 0 / max 1)로 운용한다. on/off는 desired capacity 1↔0으로 제어하며,
+# 스팟 인스턴스라 EC2 Start/StopInstances는 쓸 수 없다.
+# (one-time 스팟 요청은 stop 불가, ASG 소속 인스턴스는 stop해도 ASG가 교체한다)
+ASG_NAME = os.environ.get("ASG_NAME", "snorose-dev-application-asg")
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
-DEV_SERVER_HEALTH_PORT = os.environ.get("DEV_SERVER_HEALTH_PORT", "8081")
-DEV_SERVER_HEALTH_PATH = os.environ.get("DEV_SERVER_HEALTH_PATH", "/actuator/health")
-ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-bucket")
+ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-dev-bucket")
 ACTIVE_TEAMS_KEY = os.environ.get("ACTIVE_TEAMS_KEY", "dev-manager/active-teams.json")
+
+# 인스턴스가 살아있다고 볼 EC2 상태. terminated/shutting-down은 제외해야 한다 —
+# 태그 조회는 종료된 지 얼마 안 된 인스턴스까지 함께 돌려주기 때문이다.
+LIVE_INSTANCE_STATES = ["pending", "running"]
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
@@ -33,9 +37,15 @@ ROLE_MAPPING = {
 
 ec2_client = None
 s3_client = None
+asg_client = None
+elbv2_client = None
 
 
 class ActiveTeamsStateError(Exception):
+    pass
+
+
+class AsgLookupError(Exception):
     pass
 
 
@@ -57,6 +67,26 @@ def get_s3_client():
 
         s3_client = boto3.client("s3", region_name=AWS_REGION)
     return s3_client
+
+
+def get_asg_client():
+    global asg_client
+
+    if asg_client is None:
+        import boto3
+
+        asg_client = boto3.client("autoscaling", region_name=AWS_REGION)
+    return asg_client
+
+
+def get_elbv2_client():
+    global elbv2_client
+
+    if elbv2_client is None:
+        import boto3
+
+        elbv2_client = boto3.client("elbv2", region_name=AWS_REGION)
+    return elbv2_client
 
 
 def normalize_active_teams(teams):
@@ -106,42 +136,75 @@ def format_active_teams(teams):
     return ", ".join(teams) if teams else "없음"
 
 
-def get_instance_id_by_name(instance_name):
+def get_asg():
+    try:
+        groups = get_asg_client().describe_auto_scaling_groups(
+            AutoScalingGroupNames=[ASG_NAME]
+        ).get("AutoScalingGroups", [])
+    except Exception as e:
+        raise AsgLookupError(f"ASG 조회 오류: {e}") from e
+
+    if not groups:
+        raise AsgLookupError(f"❌ ASG '{ASG_NAME}'를 찾을 수 없습니다.")
+    return groups[0]
+
+
+def get_active_instance_id():
+    """ASG가 붙들고 있는 인스턴스 중 pending/running 상태인 것 하나를 반환한다.
+
+    Name 태그로 찾지 않는다. describe_instances의 태그 필터는 종료된 인스턴스까지
+    돌려주기 때문에, 스팟 회수 직후에 죽은 인스턴스를 붙잡는 사고가 난다.
+    """
+    try:
+        asg = get_asg()
+    except AsgLookupError:
+        return None
+
+    instance_ids = [i["InstanceId"] for i in asg.get("Instances", [])]
+    if not instance_ids:
+        return None
+
     try:
         response = get_ec2_client().describe_instances(
-            Filters=[{"Name": "tag:Name", "Values": [instance_name]}]
+            InstanceIds=instance_ids,
+            Filters=[{"Name": "instance-state-name", "Values": LIVE_INSTANCE_STATES}],
         )
-        instances = response.get("Reservations", [])
-
-        if not instances:
-            return None
-
-        return instances[0]["Instances"][0]["InstanceId"]
-
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
+    except Exception:
         return None
+
+    for reservation in response.get("Reservations", []):
+        for instance in reservation.get("Instances", []):
+            return instance["InstanceId"]
+    return None
 
 
 # 인스턴스 상태 조회
 def get_instance_state():
-    instance_id = get_instance_id_by_name(INSTANCE_NAME)
-    if not instance_id:
-        return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
-
     try:
-        response = get_ec2_client().describe_instances(InstanceIds=[instance_id])
-        state = response["Reservations"][0]["Instances"][0]["State"]["Name"]
-        return state
-    except Exception as e:
-        return f"오류 발생: {str(e)}"
+        asg = get_asg()
+    except AsgLookupError as e:
+        return str(e)
+
+    instance_id = get_active_instance_id()
+    if instance_id:
+        try:
+            response = get_ec2_client().describe_instances(InstanceIds=[instance_id])
+            return response["Reservations"][0]["Instances"][0]["State"]["Name"]
+        except Exception as e:
+            return f"오류 발생: {str(e)}"
+
+    lifecycle_states = [i.get("LifecycleState", "") for i in asg.get("Instances", [])]
+    if any(state.startswith("Terminating") for state in lifecycle_states):
+        return "stopping"
+
+    return "pending" if asg["DesiredCapacity"] >= 1 else "stopped"
 
 
 # 인스턴스 상태 검사 결과 조회
 def get_instance_status():
-    instance_id = get_instance_id_by_name(INSTANCE_NAME)
+    instance_id = get_active_instance_id()
     if not instance_id:
-        return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
+        return "⚠️ 실행 중인 인스턴스가 없습니다."
 
     try:
         response = get_ec2_client().describe_instance_status(InstanceIds=[instance_id])
@@ -160,7 +223,7 @@ def get_instance_status():
 
     except Exception as e:
         return f"오류 발생: {str(e)}"
-    
+
 
 def handle_start_dev(user_roles):
     if not user_roles:
@@ -171,10 +234,7 @@ def handle_start_dev(user_roles):
     except ActiveTeamsStateError as e:
         return f"❌ {str(e)}"
 
-    if not active_teams:
-        start_msg = start_instance()
-    else:
-        start_msg = "✅ 서버가 이미 실행 중입니다."
+    start_msg = start_instance()
 
     added_roles = [role for role in user_roles if role not in active_teams]
     if added_roles:
@@ -212,31 +272,45 @@ def handle_stop_dev(user_roles):
     return stop_msg
 
 
-def get_instance_public_ip():
-    instance_id = get_instance_id_by_name(INSTANCE_NAME)
-    if not instance_id:
-        return None
+def get_target_group_arn():
     try:
-        response = get_ec2_client().describe_instances(InstanceIds=[instance_id])
-        return response["Reservations"][0]["Instances"][0].get("PublicIpAddress")
-    except Exception:
+        asg = get_asg()
+    except AsgLookupError:
         return None
+
+    target_group_arns = asg.get("TargetGroupARNs", [])
+    return target_group_arns[0] if target_group_arns else None
 
 
 def check_app_health():
-    public_ip = get_instance_public_ip()
-    if not public_ip:
+    """ALB Target Group 헬스체크 결과로 앱 상태를 판단한다.
+
+    앱 서버는 private subnet에 있어 public IP가 없고 Lambda도 VPC 밖이라,
+    인스턴스로 직접 HTTP를 찌를 수 없다. TG가 이미 /health/check를 보고 있으므로
+    그 판정을 그대로 읽는다.
+    """
+    target_group_arn = get_target_group_arn()
+    if not target_group_arn:
         return None
-    url = f"http://{public_ip}:{DEV_SERVER_HEALTH_PORT}{DEV_SERVER_HEALTH_PATH}"
+
     try:
-        req = urllib.request.urlopen(url, timeout=2)
-        if req.status == 200:
-            return "✅ 애플리케이션 응답 정상"
-        return f"⚠️ 애플리케이션 응답 이상 (HTTP {req.status})"
-    except urllib.error.URLError as e:
-        return f"❌ 애플리케이션 네트워크 오류: {e.reason}"
+        descriptions = get_elbv2_client().describe_target_health(
+            TargetGroupArn=target_group_arn
+        )["TargetHealthDescriptions"]
     except Exception as e:
         return f"❌ 애플리케이션 상태 확인 실패: {str(e)}"
+
+    if not descriptions:
+        return "⏳ ALB에 등록된 대상이 없습니다. (기동 또는 배포 진행 중)"
+
+    states = [d["TargetHealth"]["State"] for d in descriptions]
+    if "healthy" in states:
+        return "✅ 애플리케이션 응답 정상"
+    if "initial" in states:
+        return "⏳ 애플리케이션 기동 중... (CodeDeploy 재배포 포함 8~10분)"
+
+    detail = descriptions[0]["TargetHealth"].get("Description") or states[0]
+    return f"❌ 애플리케이션 응답 이상 ({detail})"
 
 
 def handle_status_dev():
@@ -250,9 +324,16 @@ def handle_status_dev():
     if instance_state == "running":
         app_health = check_app_health()
         is_initializing = "진행 중" in instance_status
-        has_app_error = app_health and "❌" in app_health
+        is_app_starting = bool(app_health) and "⏳" in app_health
+        has_app_error = bool(app_health) and "❌" in app_health
 
-        prefix = "⚠️" if (is_initializing or has_app_error) else "✅"
+        if has_app_error:
+            prefix = "⚠️"
+        elif is_initializing or is_app_starting:
+            prefix = "⏳"
+        else:
+            prefix = "✅"
+
         msg = f"{prefix} DEV 서버가 실행 중입니다.\n{instance_status}"
         if app_health:
             msg += f"\n{app_health}"
@@ -261,7 +342,7 @@ def handle_status_dev():
 
     status_messages = {
         "stopped": "❌ DEV 서버가 중지되었습니다.",
-        "pending": "⏳ DEV 서버가 시작 중입니다...",
+        "pending": "⏳ DEV 서버가 시작 중입니다... (재배포 포함 8~10분)",
         "stopping": "⏳ DEV 서버가 중지 중입니다...",
     }
 
@@ -269,27 +350,54 @@ def handle_status_dev():
 
 
 def start_instance():
-    instance_id = get_instance_id_by_name(INSTANCE_NAME)
-    if not instance_id:
-        return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
+    try:
+        asg = get_asg()
+    except AsgLookupError as e:
+        return str(e)
+
+    if asg["DesiredCapacity"] >= 1:
+        return "✅ 서버가 이미 실행 중입니다."
 
     try:
-        get_ec2_client().start_instances(InstanceIds=[instance_id])
-        return "🚀 서버를 시작 중입니다... (잠시 후 `status_dev`로 확인하세요)"
+        get_asg_client().set_desired_capacity(
+            AutoScalingGroupName=ASG_NAME,
+            DesiredCapacity=1,
+            HonorCooldown=False,
+        )
     except Exception as e:
         return f"서버 시작 실패: {str(e)}"
 
+    return "🚀 서버를 시작 중입니다... (재배포 포함 8~10분, `status_dev`로 확인하세요)"
+
 
 def stop_instance():
-    instance_id = get_instance_id_by_name(INSTANCE_NAME)
-    if not instance_id:
-        return "❌ 해당 이름의 인스턴스를 찾을 수 없습니다."
+    try:
+        asg = get_asg()
+    except AsgLookupError as e:
+        return str(e)
+
+    # min_size가 0이 아니면 desired를 0으로 내릴 수 없다.
+    # Terraform에서 asg_min_size가 되돌아간 경우를 여기서 바로 드러낸다.
+    if asg["MinSize"] > 0:
+        return (
+            f"서버 중지 실패: ASG min_size가 {asg['MinSize']}라 0으로 내릴 수 없습니다. "
+            "(Terraform의 asg_min_size 설정을 확인해주세요)"
+        )
+
+    if asg["DesiredCapacity"] == 0:
+        return "✅ 서버가 이미 중지되어 있습니다."
 
     try:
-        get_ec2_client().stop_instances(InstanceIds=[instance_id])
-        return "🛑 서버를 중지 중입니다..."
+        get_asg_client().set_desired_capacity(
+            AutoScalingGroupName=ASG_NAME,
+            DesiredCapacity=0,
+            HonorCooldown=False,
+        )
     except Exception as e:
         return f"서버 중지 실패: {str(e)}"
+
+    return "🛑 서버를 중지 중입니다..."
+
 
 @app.route("/interactions", methods=["POST"])
 @app.route("/", methods=["POST"])

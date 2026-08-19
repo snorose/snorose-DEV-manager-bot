@@ -62,13 +62,18 @@ jobs:
           --function-name ${{ vars.LAMBDA_FUNCTION_NAME }}
 
     # Lambda 환경 변수 설정
+    # update-function-configuration은 환경변수 맵 전체를 덮어쓴다.
+    # 여기에 없는 변수는 배포 때마다 유실되므로, 콘솔에서 수동으로 추가하지 말고
+    # 반드시 이 목록에 함께 넣어야 한다.
     - name: Update Lambda Environment Variables
       run: |
         aws lambda update-function-configuration \
           --function-name ${{ vars.LAMBDA_FUNCTION_NAME }} \
           --environment "Variables={ \
             DISCORD_PUBLIC_KEY=${{ vars.DISCORD_PUBLIC_KEY }}, \
-            ACTIVE_TEAMS_BUCKET=${{ vars.ACTIVE_TEAMS_BUCKET || 'snorose-dev-bucket' }} \
+            ACTIVE_TEAMS_BUCKET=${{ vars.ACTIVE_TEAMS_BUCKET || 'snorose-dev-bucket' }}, \
+            ACTIVE_TEAMS_KEY=${{ vars.ACTIVE_TEAMS_KEY || 'dev-manager/active-teams.json' }}, \
+            ASG_NAME=${{ vars.ASG_NAME || 'snorose-dev-application-asg' }} \
           }"
 
     # Discord slash command registration

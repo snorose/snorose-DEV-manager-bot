@@ -1,0 +1,43 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageActiveTeamsObject",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::snorose-dev-bucket/dev-manager/active-teams.json"
+    },
+    {
+      "Sid": "ListActiveTeamsObject",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::snorose-dev-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "dev-manager/active-teams.json"
+        }
+      }
+    },
+    {
+      "Sid": "ControlDevAsgCapacity",
+      "Effect": "Allow",
+      "Action": "autoscaling:SetDesiredCapacity",
+      "Resource": "arn:aws:autoscaling:ap-northeast-2:621962613485:autoScalingGroup:*:autoScalingGroupName/snorose-dev-application-asg"
+    },
+    {
+      "Sid": "ReadDevServerState",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeScalingActivities",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
+        "elasticloadbalancing:DescribeTargetHealth"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
