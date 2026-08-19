@@ -67,7 +67,8 @@ jobs:
         aws lambda update-function-configuration \
           --function-name ${{ vars.LAMBDA_FUNCTION_NAME }} \
           --environment "Variables={ \
-            DISCORD_PUBLIC_KEY=${{ vars.DISCORD_PUBLIC_KEY }} \
+            DISCORD_PUBLIC_KEY=${{ vars.DISCORD_PUBLIC_KEY }}, \
+            ACTIVE_TEAMS_BUCKET=${{ vars.ACTIVE_TEAMS_BUCKET || 'snorose-dev-bucket' }} \
           }"
 
     # Discord slash command registration
