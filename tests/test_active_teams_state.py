@@ -55,7 +55,7 @@ class ActiveTeamsStateTest(unittest.TestCase):
         main = import_main()
         fake_s3 = FakeS3Client()
         main.s3_client = fake_s3
-        main.start_instance = lambda: "🚀 서버를 시작 중입니다..."
+        main.start_dev_stack = lambda: "🚀 DEV 환경을 시작 중입니다..."
 
         message = main.handle_start_dev(["인프라"])
 
@@ -76,12 +76,12 @@ class ActiveTeamsStateTest(unittest.TestCase):
         fake_s3 = FakeS3Client(json.dumps({"active_teams": ["인프라"]}))
         main.s3_client = fake_s3
         stop_calls = []
-        main.stop_instance = lambda: stop_calls.append(True) or "🛑 서버를 중지 중입니다..."
+        main.stop_dev_stack = lambda: stop_calls.append(True) or "🛑 DEV 환경을 중지 중입니다..."
 
         message = main.handle_stop_dev(["인프라"])
 
         self.assertIn("인프라 팀이 테스트를 종료했습니다.", message)
-        self.assertIn("🛑 서버를 중지 중입니다...", message)
+        self.assertIn("🛑 DEV 환경을 중지 중입니다...", message)
         self.assertEqual(fake_s3.active_teams, [])
         self.assertEqual(stop_calls, [True])
 
@@ -93,7 +93,7 @@ class ActiveTeamsStateTest(unittest.TestCase):
         main = import_main()
         main.s3_client = BrokenS3Client()
         stop_calls = []
-        main.stop_instance = lambda: stop_calls.append(True) or "🛑 서버를 중지 중입니다..."
+        main.stop_dev_stack = lambda: stop_calls.append(True) or "🛑 DEV 환경을 중지 중입니다..."
 
         message = main.handle_stop_dev(["인프라"])
 
@@ -106,6 +106,7 @@ class ActiveTeamsStateTest(unittest.TestCase):
         main.s3_client = fake_s3
         main.get_instance_state = lambda: "running"
         main.get_instance_status = lambda: "✅ 상태 검사 통과!"
+        main.get_fck_nat_state = lambda: "running"
         main.check_app_health = lambda: "✅ 애플리케이션 응답 정상"
 
         message = main.handle_status_dev()

@@ -28,6 +28,26 @@
       "Resource": "arn:aws:autoscaling:ap-northeast-2:621962613485:autoScalingGroup:*:autoScalingGroupName/snorose-dev-application-asg"
     },
     {
+      "Sid": "ControlDevFckNatInstance",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances"
+      ],
+      "Resource": "arn:aws:ec2:ap-northeast-2:621962613485:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/Name": "snorose-dev-an2-fck-nat"
+        }
+      }
+    },
+    {
+      "Sid": "InvokeManagerBotAsyncWorker",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:ap-northeast-2:621962613485:function:SnoroseDevManagerBot"
+    },
+    {
       "Sid": "ReadDevServerState",
       "Effect": "Allow",
       "Action": [

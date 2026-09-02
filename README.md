@@ -50,7 +50,7 @@ GitHub Actions가 ```develop```, ```main``` 브랜치 push를 감지해 Docker �
 1. AWS에 Lambda 함수, ECR Repository, GitHub OIDC용 IAM Role을 미리 준비합니다.
 2. GitHub Environment를 설정합니다. ```develop``` 브랜치는 ```DEV```, ```main``` 브랜치는 ```PROD``` Environment를 사용합니다.
 3. 각 Environment variable에 ```AWS_ROLE_ARN```, ```AWS_REGION```, ```ECR_REPOSITORY_NAME```, ```LAMBDA_FUNCTION_NAME```, ```DISCORD_PUBLIC_KEY```, ```DISCORD_APPLICATION_ID```를 설정합니다.
-   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```은 생략하면 DEV 기본값이 쓰입니다.
+   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```은 생략하면 DEV 기본값이 쓰입니다.
    Lambda 환경변수는 워크플로가 맵 전체를 덮어쓰므로, 콘솔에서 직접 추가하면 다음 배포 때 사라집니다.
 4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다.
 5. ```develop``` 또는 ```main``` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
@@ -59,20 +59,28 @@ GitHub Actions가 ```develop```, ```main``` 브랜치 push를 감지해 Docker �
 
 ## 필요 IAM 권한
 
-DEV 서버는 EC2 인스턴스를 직접 start/stop하지 않고, ASG(`snorose-dev-application-asg`)의
-desired capacity를 1↔0으로 조정해 on/off합니다. 스팟 인스턴스는 one-time 요청이라
+앱 서버는 EC2 인스턴스를 직접 start/stop하지 않고, ASG(`snorose-dev-application-asg`)의
+desired capacity를 1↔0으로 조정합니다. 스팟 인스턴스는 one-time 요청이라
 `StopInstances`가 불가능하고, ASG 소속 인스턴스는 stop해도 ASG가 다시 교체하기 때문입니다.
+
+fck-nat는 non-HA On-Demand 단일 인스턴스로 구성하며 앱 서버와 함께 제어합니다.
+`start_dev`는 fck-nat를 시작하고 EC2 상태 검사가 통과한 뒤 앱 ASG를 1로 올립니다.
+`stop_dev`는 앱 ASG를 0으로 내리고 인스턴스가 제거된 뒤 fck-nat를 정지합니다.
+대기 작업은 같은 Lambda를 비동기로 호출해 처리하므로 Discord interaction 응답을 막지 않습니다.
+Lambda timeout은 배포 워크플로에서 180초로 설정합니다.
 
 Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`에 정리되어 있습니다.
 
 | 권한 | 용도 |
 |---|---|
 | `autoscaling:SetDesiredCapacity` | `start_dev` / `stop_dev` |
+| `ec2:StartInstances`, `ec2:StopInstances` | fck-nat 시작 / 중지 |
 | `autoscaling:DescribeAutoScalingGroups` | 인스턴스 목록, min/desired, Target Group ARN 조회 |
 | `autoscaling:DescribeScalingActivities` | 스케일링 실패 원인 조회 |
 | `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus` | 인스턴스 상태 검사 |
 | `elasticloadbalancing:DescribeTargetHealth` | `status_dev`의 앱 헬스체크 |
 | `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일 |
+| `lambda:InvokeFunction` | NAT 및 앱의 순차 시작·중지 작업을 비동기로 실행 |
 
 앱 헬스체크는 인스턴스에 직접 HTTP 요청을 보내지 않고 ALB Target Group의 판정을 읽습니다.
 앱 서버가 private subnet에 있어 public IP가 없고, Lambda도 VPC 밖이라 직접 접근이 불가능합니다.
@@ -82,5 +90,6 @@ Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`�
 ```bash
 python tests/test_active_teams_state.py
 python tests/test_asg_control.py
+python tests/test_fck_nat_control.py
 python tests/test_runtime_config.py
 ```
