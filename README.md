@@ -63,23 +63,39 @@ GitHub Actions가 ```develop```, ```main``` 브랜치 push를 감지해 Docker �
 desired capacity를 1↔0으로 조정합니다. 스팟 인스턴스는 one-time 요청이라
 `StopInstances`가 불가능하고, ASG 소속 인스턴스는 stop해도 ASG가 다시 교체하기 때문입니다.
 
-fck-nat는 non-HA On-Demand 단일 인스턴스로 구성하며 앱 서버와 함께 제어합니다.
-`start_dev`는 fck-nat를 시작하고 EC2 상태 검사가 통과한 뒤 앱 ASG를 1로 올립니다.
-`stop_dev`는 앱 ASG를 0으로 내리고 인스턴스가 제거된 뒤 fck-nat를 정지합니다.
+fck-nat는 non-HA On-Demand 단일 인스턴스로 구성하며 WARP 및 앱 서버와 함께 제어합니다.
+`start_dev`는 NAT 준비 확인 → WARP 준비 확인 → 앱 ASG desired capacity 1 순서로 실행합니다.
+`stop_dev`는 앱 ASG가 비워지고 WARP가 정지된 뒤 fck-nat를 정지합니다.
+
+준비 확인은 EC2 상태 검사와 인프라 PR #26이 생성하는 전용 SSM 문서를 사용합니다.
+NAT는 설정 실행 완료, ENI, forwarding, MASQUERADE 및 EIP를 통한 HTTPS 통신을 확인합니다.
+WARP는 서비스, 터널 연결 및 Private-1의 HTTPS 통신을 확인합니다. 검사에 실패하면 앱을
+시작하지 않습니다. fck-nat 서비스는 oneshot이므로 `is-active` 결과만으로 판단하지 않습니다.
+
+NAT와 WARP는 각각 최대 240초 동안 준비 상태를 확인하며 Lambda timeout은 600초입니다.
+SSM 결과는 eventual consistency를 고려해 재조회합니다. 실패 원인은 Lambda 로그와
+SSM Run Command 실행 기록에서 확인합니다. 이 검사는 시작 시 수행하며 상시 알림은 없습니다.
+시작 작업이 취소되어도 앱/WARP 종료를 기다린 뒤 NAT를 정지합니다. 새 시작 요청을 감지하면
+종료 작업을 취소하지만 S3 팀 상태와 EC2 제어 사이에 분산 잠금은 없습니다.
+
+DEV가 정지되어 있는 동안 WARP를 통한 DB 접근도 중단됩니다. 앱 외 DEV 작업도 해당 팀을
+활성 상태로 유지한 뒤 수행하세요. WARP와 NAT 인스턴스의 Name 태그는 각각 하나여야 하며
+중복되면 제어 대상을 임의로 선택하지 않습니다.
 대기 작업은 같은 Lambda를 비동기로 호출해 처리하므로 Discord interaction 응답을 막지 않습니다.
-Lambda timeout은 배포 워크플로에서 180초로 설정합니다.
+Lambda timeout은 배포 워크플로에서 600초로 설정합니다.
 
 Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`에 정리되어 있습니다.
 
 | 권한 | 용도 |
 |---|---|
 | `autoscaling:SetDesiredCapacity` | `start_dev` / `stop_dev` |
-| `ec2:StartInstances`, `ec2:StopInstances` | fck-nat 시작 / 중지 |
+| `ec2:StartInstances`, `ec2:StopInstances` | fck-nat 및 WARP 시작 / 중지 |
 | `autoscaling:DescribeAutoScalingGroups` | 인스턴스 목록, min/desired, Target Group ARN 조회 |
 | `autoscaling:DescribeScalingActivities` | 스케일링 실패 원인 조회 |
 | `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus` | 인스턴스 상태 검사 |
 | `elasticloadbalancing:DescribeTargetHealth` | `status_dev`의 앱 헬스체크 |
 | `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일 |
+| `ssm:SendCommand`, `ssm:GetCommandInvocation` | 전용 NAT/WARP 문서를 실행하고 결과 확인 |
 | `lambda:InvokeFunction` | NAT 및 앱의 순차 시작·중지 작업을 비동기로 실행 |
 
 앱 헬스체크는 인스턴스에 직접 HTTP 요청을 보내지 않고 ALB Target Group의 판정을 읽습니다.
@@ -93,3 +109,16 @@ python tests/test_asg_control.py
 python tests/test_fck_nat_control.py
 python tests/test_runtime_config.py
 ```
+
+
+추가 환경변수는 배포 워크플로에서도 유지합니다.
+
+| 변수 | DEV 기본값 |
+| --- | --- |
+| `WARP_NAME` | `WARPConnector-dev` |
+| `NAT_READINESS_DOCUMENT` | `snorose-dev-fck-nat-ready` |
+| `WARP_READINESS_DOCUMENT` | `snorose-dev-warp-ready` |
+
+인프라 PR #26의 SSM 문서와 IAM 권한을 먼저 적용한 뒤 이 봇을 배포해야 합니다.
+SSM 진단 문서는 임의 명령 파라미터를 받지 않으며 다른 인스턴스에 대한 실행 권한도 부여하지 않습니다.
+기존 NAT Gateway 상태에서는 이 봇의 새 시작 절차를 사용할 수 없습니다.

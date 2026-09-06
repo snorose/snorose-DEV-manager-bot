@@ -107,6 +107,7 @@ class ActiveTeamsStateTest(unittest.TestCase):
         main.get_instance_state = lambda: "running"
         main.get_instance_status = lambda: "✅ 상태 검사 통과!"
         main.get_fck_nat_state = lambda: "running"
+        main.get_warp_state = lambda: "running"
         main.check_app_health = lambda: "✅ 애플리케이션 응답 정상"
 
         message = main.handle_status_dev()
