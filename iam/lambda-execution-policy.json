@@ -28,6 +28,40 @@
       "Resource": "arn:aws:autoscaling:ap-northeast-2:621962613485:autoScalingGroup:*:autoScalingGroupName/snorose-dev-application-asg"
     },
     {
+      "Sid": "ControlDevFckNatInstance",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances"
+      ],
+      "Resource": "arn:aws:ec2:ap-northeast-2:621962613485:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/Name": "snorose-dev-an2-fck-nat"
+        }
+      }
+    },
+    {
+      "Sid": "ControlDevWarpInstance",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances"
+      ],
+      "Resource": "arn:aws:ec2:ap-northeast-2:621962613485:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/Name": "WARPConnector-dev"
+        }
+      }
+    },
+    {
+      "Sid": "InvokeManagerBotAsyncWorker",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:ap-northeast-2:621962613485:function:SnoroseDevManagerBot"
+    },
+    {
       "Sid": "ReadDevServerState",
       "Effect": "Allow",
       "Action": [
@@ -37,6 +71,35 @@
         "ec2:DescribeInstanceStatus",
         "elasticloadbalancing:DescribeTargetHealth"
       ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "UseDevReadinessDocuments",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:ap-northeast-2:621962613485:document/snorose-dev-fck-nat-ready",
+        "arn:aws:ssm:ap-northeast-2:621962613485:document/snorose-dev-warp-ready"
+      ]
+    },
+    {
+      "Sid": "CheckDevNetworkInstances",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:ap-northeast-2:621962613485:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ssm:resourceTag/Name": [
+            "snorose-dev-an2-fck-nat",
+            "WARPConnector-dev"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadDevReadinessResult",
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
       "Resource": "*"
     }
   ]

@@ -69,12 +69,22 @@ jobs:
       run: |
         aws lambda update-function-configuration \
           --function-name ${{ vars.LAMBDA_FUNCTION_NAME }} \
+          --timeout 600 \
           --environment "Variables={ \
             DISCORD_PUBLIC_KEY=${{ vars.DISCORD_PUBLIC_KEY }}, \
             ACTIVE_TEAMS_BUCKET=${{ vars.ACTIVE_TEAMS_BUCKET || 'snorose-dev-bucket' }}, \
             ACTIVE_TEAMS_KEY=${{ vars.ACTIVE_TEAMS_KEY || 'dev-manager/active-teams.json' }}, \
-            ASG_NAME=${{ vars.ASG_NAME || 'snorose-dev-application-asg' }} \
+            ASG_NAME=${{ vars.ASG_NAME || 'snorose-dev-application-asg' }}, \
+            FCK_NAT_NAME=${{ vars.FCK_NAT_NAME || 'snorose-dev-an2-fck-nat' }}, \
+            WARP_NAME=${{ vars.WARP_NAME || 'WARPConnector-dev' }}, \
+            NAT_READINESS_DOCUMENT=${{ vars.NAT_READINESS_DOCUMENT || 'snorose-dev-fck-nat-ready' }}, \
+            WARP_READINESS_DOCUMENT=${{ vars.WARP_READINESS_DOCUMENT || 'snorose-dev-warp-ready' }} \
           }"
+
+    - name: Wait for Lambda configuration update to complete
+      run: |
+        aws lambda wait function-updated \
+          --function-name ${{ vars.LAMBDA_FUNCTION_NAME }}
 
     # Discord slash command registration
     - name: Register Discord slash commands

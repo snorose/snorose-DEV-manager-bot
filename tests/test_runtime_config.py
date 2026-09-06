@@ -25,7 +25,22 @@ class RuntimeConfigTest(unittest.TestCase):
     def test_mangum_lifespan_is_disabled_for_wsgi_adapter(self):
         import main
 
-        self.assertEqual(main.handler.lifespan, "off")
+        self.assertEqual(main.web_handler.lifespan, "off")
+
+    def test_internal_event_is_dispatched_without_mangum(self):
+        import main
+
+        main.handle_internal_event = lambda event: {"action": event["action"]}
+
+        response = main.handler(
+            {
+                "source": main.INTERNAL_EVENT_SOURCE,
+                "action": main.START_APP_AFTER_NAT_ACTION,
+            },
+            None,
+        )
+
+        self.assertEqual(response, {"action": main.START_APP_AFTER_NAT_ACTION})
 
     def test_interactions_endpoint_handles_hello_command(self):
         signing_key = SigningKey.generate()

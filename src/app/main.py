@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from mangum import Mangum
@@ -12,6 +13,11 @@ AWS_REGION = "ap-northeast-2"
 # 스팟 인스턴스라 EC2 Start/StopInstances는 쓸 수 없다.
 # (one-time 스팟 요청은 stop 불가, ASG 소속 인스턴스는 stop해도 ASG가 교체한다)
 ASG_NAME = os.environ.get("ASG_NAME", "snorose-dev-application-asg")
+FCK_NAT_NAME = os.environ.get("FCK_NAT_NAME", "snorose-dev-an2-fck-nat")
+WARP_NAME = os.environ.get("WARP_NAME", "WARPConnector-dev")
+NAT_READINESS_DOCUMENT = os.environ.get("NAT_READINESS_DOCUMENT", "snorose-dev-fck-nat-ready")
+WARP_READINESS_DOCUMENT = os.environ.get("WARP_READINESS_DOCUMENT", "snorose-dev-warp-ready")
+LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
 ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-dev-bucket")
@@ -20,10 +26,20 @@ ACTIVE_TEAMS_KEY = os.environ.get("ACTIVE_TEAMS_KEY", "dev-manager/active-teams.
 # 인스턴스가 살아있다고 볼 EC2 상태. terminated/shutting-down은 제외해야 한다 —
 # 태그 조회는 종료된 지 얼마 안 된 인스턴스까지 함께 돌려주기 때문이다.
 LIVE_INSTANCE_STATES = ["pending", "running"]
+FCK_NAT_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
+
+INTERNAL_EVENT_SOURCE = "snorose.dev-manager-bot"
+START_APP_AFTER_NAT_ACTION = "start_app_after_nat"
+STOP_NAT_AFTER_APP_ACTION = "stop_nat_after_app"
+WAIT_INTERVAL_SECONDS = 5
+NETWORK_READY_MAX_ATTEMPTS = 48
+NETWORK_READY_TIMEOUT_SECONDS = 240
+WARP_STOP_MAX_ATTEMPTS = 36
+APP_STOP_MAX_ATTEMPTS = 30
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
-handler = Mangum(asgi_app, lifespan="off")
+web_handler = Mangum(asgi_app, lifespan="off")
 
 ROLE_MAPPING = {
     "프론트엔드": "1223647596728553602",
@@ -39,6 +55,8 @@ ec2_client = None
 s3_client = None
 asg_client = None
 elbv2_client = None
+lambda_client = None
+ssm_client = None
 
 
 class ActiveTeamsStateError(Exception):
@@ -46,6 +64,14 @@ class ActiveTeamsStateError(Exception):
 
 
 class AsgLookupError(Exception):
+    pass
+
+
+class FckNatLookupError(Exception):
+    pass
+
+
+class StartCancelled(Exception):
     pass
 
 
@@ -89,6 +115,30 @@ def get_elbv2_client():
     return elbv2_client
 
 
+def get_lambda_client():
+    global lambda_client
+
+    if lambda_client is None:
+        import boto3
+
+        lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+    return lambda_client
+
+
+def get_ssm_client():
+    global ssm_client
+
+    if ssm_client is None:
+        import boto3
+        from botocore.config import Config
+
+        ssm_client = boto3.client(
+            "ssm", region_name=AWS_REGION,
+            config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 2}),
+        )
+    return ssm_client
+
+
 def normalize_active_teams(teams):
     normalized = []
     for team in teams:
@@ -99,7 +149,10 @@ def normalize_active_teams(teams):
 
 def is_missing_s3_object_error(error):
     error_code = getattr(error, "response", {}).get("Error", {}).get("Code")
-    return error_code in {"NoSuchKey", "NoSuchBucket"} or error.__class__.__name__ == "NoSuchKey"
+    return (
+        error_code in {"NoSuchKey", "NoSuchBucket"}
+        or error.__class__.__name__ == "NoSuchKey"
+    )
 
 
 def load_active_teams():
@@ -147,6 +200,257 @@ def get_asg():
     if not groups:
         raise AsgLookupError(f"❌ ASG '{ASG_NAME}'를 찾을 수 없습니다.")
     return groups[0]
+
+
+def get_network_instance(name):
+    """정지된 인스턴스도 포함하되 중복 태그가 있으면 제어 대상을 추측하지 않는다."""
+    try:
+        response = get_ec2_client().describe_instances(
+            Filters=[
+                {"Name": "tag:Name", "Values": [name]},
+                {"Name": "instance-state-name", "Values": FCK_NAT_INSTANCE_STATES},
+            ]
+        )
+    except Exception as e:
+        raise FckNatLookupError(f"{name} 조회 오류: {e}") from e
+
+    instances = [
+        instance
+        for reservation in response.get("Reservations", [])
+        for instance in reservation.get("Instances", [])
+    ]
+    if len(instances) != 1:
+        raise FckNatLookupError(f"인스턴스 '{name}'를 하나로 식별할 수 없습니다: {len(instances)}개")
+    return instances[0]
+
+
+def get_fck_nat_instance():
+    return get_network_instance(FCK_NAT_NAME)
+
+
+def get_warp_state():
+    try:
+        return get_network_instance(WARP_NAME)["State"]["Name"]
+    except FckNatLookupError as e:
+        return f"error: {e}"
+
+
+def is_instance_ready(instance_id):
+    try:
+        statuses = get_ec2_client().describe_instance_status(
+            InstanceIds=[instance_id],
+            IncludeAllInstances=True,
+        ).get("InstanceStatuses", [])
+    except Exception as e:
+        raise FckNatLookupError(f"EC2 상태 검사 오류: {e}") from e
+
+    if not statuses:
+        return False
+
+    status = statuses[0]
+    return (
+        status["InstanceStatus"]["Status"] == "ok"
+        and status["SystemStatus"]["Status"] == "ok"
+    )
+
+
+def start_fck_nat_instance():
+    instance = get_fck_nat_instance()
+    instance_id = instance["InstanceId"]
+    state = instance["State"]["Name"]
+
+    if state == "stopped":
+        get_ec2_client().start_instances(InstanceIds=[instance_id])
+        return "🚀 fck-nat를 시작 중입니다."
+    if state == "stopping":
+        return "⏳ fck-nat가 정지되는 대로 다시 시작합니다."
+    if state == "pending":
+        return "⏳ fck-nat가 이미 시작 중입니다."
+    return "✅ fck-nat가 이미 실행 중입니다."
+
+
+def stop_fck_nat_instance():
+    instance = get_fck_nat_instance()
+    instance_id = instance["InstanceId"]
+    state = instance["State"]["Name"]
+
+    if state == "stopped":
+        return "✅ fck-nat가 이미 중지되어 있습니다."
+    if state == "stopping":
+        return "⏳ fck-nat가 이미 중지 중입니다."
+
+    get_ec2_client().stop_instances(InstanceIds=[instance_id])
+    return "🛑 fck-nat를 중지 중입니다."
+
+
+def get_fck_nat_state():
+    try:
+        return get_fck_nat_instance()["State"]["Name"]
+    except FckNatLookupError as e:
+        return f"error: {e}"
+
+
+def format_fck_nat_state(state):
+    messages = {
+        "running": "✅ fck-nat 실행 중",
+        "pending": "⏳ fck-nat 시작 중",
+        "stopping": "⏳ fck-nat 중지 중",
+        "stopped": "🛑 fck-nat 중지됨",
+    }
+    return messages.get(state, f"⚠️ fck-nat 상태: {state}")
+
+
+def invoke_background_action(action):
+    if not LAMBDA_FUNCTION_NAME:
+        raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME 환경변수를 찾을 수 없습니다.")
+
+    response = get_lambda_client().invoke(
+        FunctionName=LAMBDA_FUNCTION_NAME,
+        InvocationType="Event",
+        Payload=json.dumps(
+            {"source": INTERNAL_EVENT_SOURCE, "action": action}
+        ).encode("utf-8"),
+    )
+    if response.get("StatusCode") != 202:
+        raise RuntimeError(f"비동기 작업 호출 실패: status={response.get('StatusCode')}")
+
+
+def start_dev_stack():
+    try:
+        nat_message = start_fck_nat_instance()
+        invoke_background_action(START_APP_AFTER_NAT_ACTION)
+    except Exception as e:
+        return f"❌ DEV 서버 시작 예약 실패: {e}"
+
+    return f"{nat_message}\n🚀 NAT 준비가 끝나면 WARP를 확인하고 앱 서버를 자동으로 시작합니다."
+
+
+def stop_dev_stack():
+    app_message = stop_instance()
+    if "실패" in app_message or app_message.startswith("❌"):
+        return app_message
+
+    try:
+        invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
+    except Exception as e:
+        return f"{app_message}\n❌ fck-nat 중지 예약 실패: {e}"
+
+    return f"{app_message}\n🛑 앱 서버가 종료되면 WARP와 fck-nat를 순서대로 중지합니다."
+
+
+def wait_for_network_ready(name, document_name):
+    deadline = time.monotonic() + NETWORK_READY_TIMEOUT_SECONDS
+    command_id = None
+    command_instance_id = None
+    last_status = "EC2 준비 중"
+    for attempt in range(NETWORK_READY_MAX_ATTEMPTS):
+        if not load_active_teams():
+            raise StartCancelled()
+        if time.monotonic() >= deadline:
+            break
+        instance = get_network_instance(name)
+        instance_id = instance["InstanceId"]
+        state = instance["State"]["Name"]
+        if instance_id != command_instance_id or state != "running":
+            command_id = None
+        if state == "stopped":
+            get_ec2_client().start_instances(InstanceIds=[instance_id])
+        elif state == "running" and is_instance_ready(instance_id):
+            try:
+                if command_id is None:
+                    response = get_ssm_client().send_command(
+                        InstanceIds=[instance_id], DocumentName=document_name,
+                        DocumentVersion="$DEFAULT", TimeoutSeconds=30,
+                    )
+                    command_id = response["Command"]["CommandId"]
+                    command_instance_id = instance_id
+                result = get_ssm_client().get_command_invocation(
+                    CommandId=command_id, InstanceId=instance_id,
+                )
+                last_status = result["Status"]
+                if last_status == "Success" and result.get("ResponseCode") == 0:
+                    return instance_id
+                if last_status not in {"Pending", "InProgress", "Delayed"}:
+                    # cloud-init/SSM/터널 연결이 아직 끝나지 않았으면 고정 진단을 재시도한다.
+                    command_id = None
+            except Exception as e:
+                code = getattr(e, "response", {}).get("Error", {}).get("Code")
+                if code not in {"InvalidInstanceId", "InvocationDoesNotExist"}:
+                    raise
+                last_status = code
+        if attempt < NETWORK_READY_MAX_ATTEMPTS - 1:
+            time.sleep(WAIT_INTERVAL_SECONDS)
+    raise TimeoutError(f"{name} 준비 상태 검사 시간 초과: {last_status}")
+
+
+def wait_for_fck_nat_ready():
+    return wait_for_network_ready(FCK_NAT_NAME, NAT_READINESS_DOCUMENT)
+
+
+def wait_for_warp_stopped():
+    for attempt in range(WARP_STOP_MAX_ATTEMPTS):
+        if load_active_teams() or get_asg()["DesiredCapacity"] > 0:
+            return False
+        instance = get_network_instance(WARP_NAME)
+        state = instance["State"]["Name"]
+        if state == "stopped":
+            return True
+        if state == "running":
+            get_ec2_client().stop_instances(InstanceIds=[instance["InstanceId"]])
+        if attempt < WARP_STOP_MAX_ATTEMPTS - 1:
+            time.sleep(WAIT_INTERVAL_SECONDS)
+    raise TimeoutError("WARP가 제한 시간 안에 정지되지 않았습니다. NAT는 유지합니다.")
+
+
+def stop_network_after_app():
+    if not wait_for_app_stopped() or not wait_for_warp_stopped():
+        return {"status": "cancelled", "reason": "새 시작 요청 존재"}
+    # WARP 정지 대기 중 들어온 start_dev 요청도 다시 확인한다.
+    if load_active_teams() or get_asg()["DesiredCapacity"] > 0:
+        return {"status": "cancelled", "reason": "새 시작 요청 존재"}
+    return {"status": "completed", "nat": stop_fck_nat_instance()}
+
+
+def wait_for_app_stopped():
+    for attempt in range(APP_STOP_MAX_ATTEMPTS):
+        asg = get_asg()
+
+        # 새 start_dev 요청이 들어오면 이전 stop 작업이 NAT를 내리지 않도록 취소한다.
+        if asg["DesiredCapacity"] > 0:
+            return False
+        if not asg.get("Instances", []):
+            return True
+
+        if attempt < APP_STOP_MAX_ATTEMPTS - 1:
+            time.sleep(WAIT_INTERVAL_SECONDS)
+
+    raise TimeoutError("앱 서버가 제한 시간 안에 ASG에서 제거되지 않았습니다.")
+
+
+def handle_internal_event(event):
+    action = event.get("action")
+    if action == START_APP_AFTER_NAT_ACTION:
+        try:
+            nat_instance_id = wait_for_fck_nat_ready()
+            warp_instance_id = wait_for_network_ready(WARP_NAME, WARP_READINESS_DOCUMENT)
+            if not load_active_teams():
+                raise StartCancelled()
+        except StartCancelled:
+            # 취소된 시작 작업도 앱/WARP가 종료되기 전에 NAT를 정지하면 안 된다.
+            # 시작 대기로 timeout을 소진했을 수 있어 종료 대기는 별도 호출에서 수행한다.
+            invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
+            return {"action": action, "status": "cancelled", "reason": "종료 작업 예약"}
+        app_message = start_instance()
+        if "실패" in app_message or app_message.startswith("❌"):
+            raise RuntimeError(app_message)
+        return {
+            "action": action, "status": "completed",
+            "nat_instance_id": nat_instance_id, "warp_instance_id": warp_instance_id,
+            "app": app_message,
+        }
+    if action == STOP_NAT_AFTER_APP_ACTION:
+        return {"action": action, **stop_network_after_app()}
+    raise ValueError(f"지원하지 않는 내부 작업입니다: {action}")
 
 
 def get_active_instance_id():
@@ -234,8 +538,6 @@ def handle_start_dev(user_roles):
     except ActiveTeamsStateError as e:
         return f"❌ {str(e)}"
 
-    start_msg = start_instance()
-
     added_roles = [role for role in user_roles if role not in active_teams]
     if added_roles:
         active_teams = normalize_active_teams(active_teams + added_roles)
@@ -243,8 +545,9 @@ def handle_start_dev(user_roles):
             save_active_teams(active_teams)
         except Exception as e:
             return f"❌ 활성 팀 상태 저장 오류: {str(e)}"
-        return f"{start_msg}\n테스트 중인 팀: {format_active_teams(active_teams)}"
-    return start_msg
+
+    start_msg = start_dev_stack()
+    return f"{start_msg}\n테스트 중인 팀: {format_active_teams(active_teams)}"
 
 
 def handle_stop_dev(user_roles):
@@ -268,7 +571,7 @@ def handle_stop_dev(user_roles):
         stop_msg = "⚠️ 이미 해당 팀은 테스트 중이 아닙니다."
 
     if not active_teams:
-        stop_msg += "\n" + stop_instance()
+        stop_msg += "\n" + stop_dev_stack()
     return stop_msg
 
 
@@ -316,6 +619,8 @@ def check_app_health():
 def handle_status_dev():
     instance_state = get_instance_state()
     instance_status = get_instance_status()
+    nat_state = get_fck_nat_state()
+    warp_state = get_warp_state()
     try:
         active_teams = load_active_teams()
     except ActiveTeamsStateError as e:
@@ -327,7 +632,7 @@ def handle_status_dev():
         is_app_starting = bool(app_health) and "⏳" in app_health
         has_app_error = bool(app_health) and "❌" in app_health
 
-        if has_app_error:
+        if has_app_error or nat_state != "running" or warp_state != "running":
             prefix = "⚠️"
         elif is_initializing or is_app_starting:
             prefix = "⏳"
@@ -337,8 +642,22 @@ def handle_status_dev():
         msg = f"{prefix} DEV 서버가 실행 중입니다.\n{instance_status}"
         if app_health:
             msg += f"\n{app_health}"
+        msg += f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
         msg += f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
         return msg
+
+    if instance_state == "stopped" and (nat_state in {"pending", "running", "stopping"} or warp_state in {"pending", "running", "stopping"}):
+        if active_teams:
+            return (
+                "⏳ DEV 서버가 시작 중입니다. (NAT와 WARP 준비 확인 후 앱 서버 시작)"
+                f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
+                f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
+            )
+        return (
+            "⏳ DEV 서버가 중지 중입니다."
+            f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
+            f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
+        )
 
     status_messages = {
         "stopped": "❌ DEV 서버가 중지되었습니다.",
@@ -346,7 +665,8 @@ def handle_status_dev():
         "stopping": "⏳ DEV 서버가 중지 중입니다...",
     }
 
-    return status_messages.get(instance_state, f"⚠️ 서버 상태: {instance_state}")
+    message = status_messages.get(instance_state, f"⚠️ 서버 상태: {instance_state}")
+    return f"{message}\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
 
 
 def start_instance():
@@ -416,7 +736,11 @@ def interact(raw_request):
         command_name = data["name"]
         member_roles = raw_request["member"]["roles"]
 
-        user_roles = [role_name for role_name, role_id in ROLE_MAPPING.items() if role_id in member_roles]
+        user_roles = [
+            role_name
+            for role_name, role_id in ROLE_MAPPING.items()
+            if role_id in member_roles
+        ]
 
         if command_name == "hello":
             message_content = "DEV 관리자 업무 중입니다. version 0.1"
@@ -436,6 +760,12 @@ def interact(raw_request):
         }
 
     return jsonify(response_data)
+
+
+def handler(event, context):
+    if isinstance(event, dict) and event.get("source") == INTERNAL_EVENT_SOURCE:
+        return handle_internal_event(event)
+    return web_handler(event, context)
 
 
 if __name__ == "__main__":
