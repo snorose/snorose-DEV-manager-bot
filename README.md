@@ -122,3 +122,20 @@ python tests/test_runtime_config.py
 인프라 PR #26의 SSM 문서와 IAM 권한을 먼저 적용한 뒤 이 봇을 배포해야 합니다.
 SSM 진단 문서는 임의 명령 파라미터를 받지 않으며 다른 인스턴스에 대한 실행 권한도 부여하지 않습니다.
 기존 NAT Gateway 상태에서는 이 봇의 새 시작 절차를 사용할 수 없습니다.
+
+## Discord 응답 시간
+
+Discord는 명령 접수 후 3초 이내의 최초 응답을 요구합니다.
+`start_dev`, `stop_dev`, `status_dev`는 AWS SDK 초기화나 AWS 호출 전에
+Discord 콜백 API에 `type: 5`(처리 중)를 전송합니다. 기존 Lambda 실행에서 작업을
+수행한 뒤 원래 응답을 수정하고, 수신 HTTP 요청에는 빈 `202`를 반환합니다.
+`hello`와 PING은 기존처럼 즉시 응답합니다.
+
+접수 확인에 실패하면 AWS 작업을 실행하지 않습니다. 결과 전송의 일시적 오류는
+최대 3회까지 재시도하며, 이 과정에서 AWS 작업을 다시 실행하지 않습니다.
+콜드스타트 자체가 3초를 넘는 경우까지 보장하지는 않으므로, 그 경우에는
+CloudWatch의 Init Duration과 명령 접수 로그를 별도로 확인해야 합니다.
+
+```bash
+python tests/test_deferred_interactions.py
+```

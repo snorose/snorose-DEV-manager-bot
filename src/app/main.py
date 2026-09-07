@@ -1,6 +1,9 @@
 import os
 import json
 import time
+import urllib.request
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from mangum import Mangum
@@ -719,12 +722,70 @@ def stop_instance():
     return "🛑 서버를 중지 중입니다..."
 
 
+def send_discord_response(method, path, payload, timeout):
+    # Only the fixed Discord API host receives interaction tokens.
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "SnoroseDevManagerBot/1.0"},
+        method=method,
+    )
+    attempts = 3 if method == "PATCH" else 1
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout):
+                return
+        except (HTTPError, URLError, TimeoutError) as error:
+            status = getattr(error, "code", None)
+            retryable = status is None or status == 429 or status >= 500
+            if not retryable or attempt == attempts - 1:
+                # URLs contain interaction tokens; do not include the original exception.
+                raise RuntimeError(f"Discord {method} failed (status={status})") from None
+            time.sleep(attempt + 1)
+
+
+def respond_to_deferred_command(raw_request, command_name, user_roles):
+    token = quote(raw_request["token"], safe="")
+    interaction_id = quote(raw_request["id"], safe="")
+    application_id = quote(raw_request["application_id"], safe="")
+    # Acknowledge before boto3 initialization or any AWS calls. Returning type 5
+    # after scheduling a Lambda invocation would still include SDK cold-start time.
+    try:
+        send_discord_response(
+            "POST", f"interactions/{interaction_id}/{token}/callback", {"type": 5}, timeout=2,
+        )
+    except Exception as error:
+        # Never execute a command when acknowledgement could not be confirmed.
+        print(f"Discord acknowledgement failed: {command_name} ({type(error).__name__})")
+        return jsonify({"type": 4, "data": {"content": "❌ 요청 접수를 확인하지 못해 작업을 실행하지 않았습니다. 잠시 후 다시 시도해주세요."}})
+    print(f"Discord command acknowledged: {command_name}")
+    try:
+        if command_name == "start_dev":
+            message_content = handle_start_dev(user_roles)
+        elif command_name == "stop_dev":
+            message_content = handle_stop_dev(user_roles)
+        else:
+            message_content = handle_status_dev()
+    except Exception as error:
+        print(f"Discord command failed: {command_name} ({type(error).__name__})")
+        message_content = "❌ 명령 처리 중 오류가 발생했습니다. `/status_dev`로 현재 상태를 확인해주세요."
+    try:
+        send_discord_response(
+            "PATCH", f"webhooks/{application_id}/{token}/messages/@original",
+            {"content": message_content[:2000], "allowed_mentions": {"parse": []}}, timeout=5,
+        )
+        print(f"Discord command response updated: {command_name}")
+    except RuntimeError as error:
+        # The command has already run. Only retry the message, never the AWS action.
+        print(f"Discord response update failed: {command_name} ({error})")
+    # Discord already received the callback; do not send a second interaction response.
+    return "", 202
+
+
 @app.route("/interactions", methods=["POST"])
 @app.route("/", methods=["POST"])
 async def interactions():
-    print(f"👉 Request: {request.json}")
-    raw_request = request.json
-    return interact(raw_request)
+    return interact(request.json)
 
 
 @verify_key_decorator(DISCORD_PUBLIC_KEY)
@@ -732,33 +793,21 @@ def interact(raw_request):
     if raw_request["type"] == 1:  # PING
         response_data = {"type": 1}  # PONG
     else:
-        data = raw_request["data"]
-        command_name = data["name"]
-        member_roles = raw_request["member"]["roles"]
-
+        command_name = raw_request["data"]["name"]
+        member_roles = raw_request.get("member", {}).get("roles", [])
         user_roles = [
             role_name
             for role_name, role_id in ROLE_MAPPING.items()
             if role_id in member_roles
         ]
-
+        print(f"Discord command received: {command_name}")
         if command_name == "hello":
             message_content = "DEV 관리자 업무 중입니다. version 1.0"
-
-        elif command_name == "start_dev":
-            message_content = handle_start_dev(user_roles)
-
-        elif command_name == "stop_dev":
-            message_content = handle_stop_dev(user_roles)
-
-        elif command_name == "status_dev":
-            message_content = handle_status_dev()
-
-        response_data = {
-            "type": 4,
-            "data": {"content": message_content},
-        }
-
+        elif command_name in {"start_dev", "stop_dev", "status_dev"}:
+            return respond_to_deferred_command(raw_request, command_name, user_roles)
+        else:
+            message_content = "❌ 지원하지 않는 명령입니다."
+        response_data = {"type": 4, "data": {"content": message_content}}
     return jsonify(response_data)
 
 
