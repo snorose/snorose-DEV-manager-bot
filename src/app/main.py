@@ -564,8 +564,10 @@ def handle_internal_event(event):
             if not load_active_teams():
                 raise StartCancelled()
             rds_state = start_rds()
-            if rds_state != "available":
+            if rds_state not in {"available", "starting", "stopping"}:
                 return {"action": action, "status": "waiting", "rds": rds_state}
+            # RDS recovery runs while NAT/WARP become ready. The ASG's CodeDeploy
+            # launch hook starts the app, so capacity still waits for both checks.
             nat_instance_id = wait_for_fck_nat_ready()
             warp_instance_id = wait_for_network_ready(WARP_NAME, WARP_READINESS_DOCUMENT)
             # An old stop may have reached RDS while network readiness was pending.

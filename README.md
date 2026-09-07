@@ -64,7 +64,8 @@ desired capacity를 1↔0으로 조정합니다. 스팟 인스턴스는 one-time
 `StopInstances`가 불가능하고, ASG 소속 인스턴스는 stop해도 ASG가 다시 교체하기 때문입니다.
 
 fck-nat는 non-HA On-Demand 단일 인스턴스로 구성하며 WARP 및 앱 서버와 함께 제어합니다.
-`start_dev`는 dev RDS를 시작하고, RDS `available` → NAT 준비 확인 → WARP 준비 확인 → 앱 ASG desired capacity 1 순서로 진행합니다.
+`start_dev`는 RDS 시작을 요청한 직후 NAT를 켭니다. RDS 복구가 진행되는 동안 NAT → WARP 준비 검사를 수행하고,
+네트워크와 RDS `available`을 모두 확인하면 앱 ASG desired capacity를 1로 올립니다.
 `stop_dev`는 마지막 팀이 종료할 때 앱 ASG를 0으로 내리고, 앱이 모두 사라진 뒤 WARP·fck-nat와 RDS를 정지합니다.
 
 RDS 시작·정지는 수분 이상 걸릴 수 있어 한 Lambda 안에서 계속 기다리지 않습니다.
@@ -137,8 +138,12 @@ SSM 진단 문서는 임의 명령 파라미터를 받지 않으며 다른 인�
 
 `Snorose-Server`의 기존 머지 후 자동 기동을 유지합니다. CD는 S3의
 `dev-manager/deployments/{run_id}-{attempt}.json`에 배포 보호 기록을 남긴 뒤 RDS를 시작합니다.
-RDS가 `available`이 되면 기존 NAT 준비 확인과 앱 ASG 기동, CodeDeploy, 스모크 테스트를 진행합니다.
+CD도 RDS와 NAT 준비를 병렬로 진행하고, 두 작업이 모두 성공하면 앱 ASG 기동, CodeDeploy, 스모크 테스트를 진행합니다.
 봇으로 먼저 dev를 켤 필요는 없습니다. CD는 활성 팀 목록을 수정하지 않습니다.
+
+ASG가 기동하면 CodeDeploy launch hook이 앱을 자동 배포하므로 ASG는 RDS와 병렬로 시작하지 않습니다.
+DB가 준비되기 전에 앱이 시작되면 현재 약 2분의 서비스 검증 제한에 걸릴 수 있습니다. ASG까지 병렬화하려면
+앱 시작 훅에 DB 대기를 먼저 추가해야 합니다. 현재 준비 시간은 `max(RDS 복구, NAT/WARP 준비) + 앱 기동`입니다.
 
 유효한 배포 기록이 있으면 봇은 앱·네트워크·RDS를 종료하지 않습니다. 마지막 팀의 `/stop_dev`는
 팀 등록을 유지한 채 보류하고, 배포 후 다시 실행하도록 안내합니다. 배포와 스모크 테스트가 끝나면

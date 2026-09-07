@@ -22,7 +22,8 @@ class RdsLifecycleTest(unittest.TestCase):
         self.assertIn("RDS: starting", main.handle_start_dev(["인프라"]))
         self.assertEqual(self.worker(main.START_APP_AFTER_NAT_ACTION)["status"], "waiting")
         self.assertEqual(main.asg_client.set_calls, [])
-        self.assertEqual(main.ssm_client.calls, [])
+        self.assertEqual([c["DocumentName"] for c in main.ssm_client.calls],
+                         [main.NAT_READINESS_DOCUMENT, main.WARP_READINESS_DOCUMENT])
 
         # Recovery can take longer than a Lambda invocation: no sleeps or self-loop.
         for _ in range(3):
@@ -34,7 +35,26 @@ class RdsLifecycleTest(unittest.TestCase):
         self.assertEqual(self.worker(main.START_APP_AFTER_NAT_ACTION)["status"], "completed")
         self.assertEqual(main.asg_client.set_calls, [1])
         self.assertEqual([c["DocumentName"] for c in main.ssm_client.calls],
-                         [main.NAT_READINESS_DOCUMENT, main.WARP_READINESS_DOCUMENT])
+                         [main.NAT_READINESS_DOCUMENT, main.WARP_READINESS_DOCUMENT] * 2)
+
+    def test_database_ready_during_network_preparation_starts_app_without_another_schedule(self):
+        main = self.main
+        main.rds_client.state = "stopped"
+        prepared = []
+
+        def prepare(name, document):
+            self.assertEqual(main.rds_client.start_calls, ["snorose-dev"])
+            self.assertEqual(main.asg_client.set_calls, [])
+            prepared.append(name)
+            if name == main.WARP_NAME:
+                main.rds_client.state = "available"
+            return "i-network"
+
+        main.wait_for_network_ready = prepare
+        result = self.worker(main.START_APP_AFTER_NAT_ACTION)
+        self.assertEqual(prepared, [main.FCK_NAT_NAME, main.WARP_NAME])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(main.asg_client.set_calls, [1])
 
     def test_repeated_start_does_not_restart_an_available_database(self):
         main = self.main
