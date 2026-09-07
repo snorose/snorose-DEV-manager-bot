@@ -65,7 +65,7 @@ class RuntimeConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["data"]["content"], "DEV 관리자 업무 중입니다. version 0.1")
+        self.assertEqual(response.get_json()["data"]["content"], "DEV 관리자 업무 중입니다. version 1.0")
 
     def test_register_commands_does_not_hardcode_discord_bot_token(self):
         register_commands = PROJECT_ROOT / "commands" / "register_commands.py"
