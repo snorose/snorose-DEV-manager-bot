@@ -743,7 +743,7 @@ def interact(raw_request):
         ]
 
         if command_name == "hello":
-            message_content = "DEV 관리자 업무 중입니다. version 0.1"
+            message_content = "DEV 관리자 업무 중입니다. version 1.0"
 
         elif command_name == "start_dev":
             message_content = handle_start_dev(user_roles)
