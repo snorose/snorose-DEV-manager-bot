@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import uuid
 import urllib.request
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -27,6 +28,8 @@ DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
 ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-dev-bucket")
 ACTIVE_TEAMS_KEY = os.environ.get("ACTIVE_TEAMS_KEY", "dev-manager/active-teams.json")
 DEPLOYMENTS_PREFIX = "dev-manager/deployments/"
+STARTUP_LOCK_KEY = "dev-manager/startup-lock.json"
+STARTUP_LOCK_SECONDS = 660  # Longer than the Lambda's 600-second timeout.
 
 # 인스턴스가 살아있다고 볼 EC2 상태. terminated/shutting-down은 제외해야 한다 —
 # 태그 조회는 종료된 지 얼마 안 된 인스턴스까지 함께 돌려주기 때문이다.
@@ -244,6 +247,51 @@ def has_active_deployment():
         continuation = {"ContinuationToken": page["NextContinuationToken"]}
 
 
+def acquire_startup_lock():
+    now = int(datetime.now(timezone.utc).timestamp())
+    request = {
+        "Bucket": ACTIVE_TEAMS_BUCKET, "Key": STARTUP_LOCK_KEY,
+        "Body": json.dumps({"owner": str(uuid.uuid4()), "expires_at": now + STARTUP_LOCK_SECONDS}),
+        "ContentType": "application/json",
+    }
+    try:
+        # Create first: GetObject on a missing key can return AccessDenied when
+        # ListBucket is restricted. Conditional creation needs no bucket listing.
+        return get_s3_client().put_object(**request, IfNoneMatch="*")["ETag"]
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        if code == "ConditionalRequestConflict":
+            return None
+        if code != "PreconditionFailed":
+            raise
+
+    try:
+        response = get_s3_client().get_object(Bucket=ACTIVE_TEAMS_BUCKET, Key=STARTUP_LOCK_KEY)
+        lock = json.loads(response["Body"].read())
+        if type(lock["expires_at"]) is not int:
+            raise ValueError("시작 작업 잠금의 만료 시각이 올바르지 않습니다.")
+        if lock["expires_at"] > now:
+            return None
+        return get_s3_client().put_object(**request, IfMatch=response["ETag"])["ETag"]
+    except Exception as error:
+        if getattr(error, "response", {}).get("Error", {}).get("Code") in {
+            "PreconditionFailed", "ConditionalRequestConflict", "NoSuchKey",
+        }:
+            return None  # Another invocation acquired or changed the lock first.
+        raise
+
+
+def release_startup_lock(etag):
+    try:
+        get_s3_client().put_object(
+            Bucket=ACTIVE_TEAMS_BUCKET, Key=STARTUP_LOCK_KEY,
+            Body=json.dumps({"expires_at": 0}), ContentType="application/json", IfMatch=etag,
+        )
+    except Exception as error:
+        # Never overwrite a newer owner's lock. A failed release expires naturally.
+        print(f"시작 작업 잠금 해제 실패: {error}")
+
+
 def get_asg():
     try:
         groups = get_asg_client().describe_auto_scaling_groups(
@@ -433,7 +481,25 @@ def reconcile_rds():
         return {"status": "completed" if state == "available" else "waiting", "rds": state}
     # Includes the automatic RDS restart after seven stopped days. Never stop a DB
     # while any app instance remains, including a target still draining from the ALB.
-    return stop_rds_if_idle()
+    result = stop_rds_if_idle()
+    if dev_is_idle():
+        result["network"] = reconcile_idle_network()
+    return result
+
+
+def reconcile_idle_network():
+    # A failed build can leave NAT running before an app was ever launched.
+    # Do not wait inside the periodic invocation; revisit stopping states next minute.
+    if not dev_is_idle():
+        return "cancelled"
+    warp = get_network_instance(WARP_NAME)
+    state = warp["State"]["Name"]
+    if state == "running" and dev_is_idle():
+        get_ec2_client().stop_instances(InstanceIds=[warp["InstanceId"]])
+        return "WARP stopping"
+    if state == "stopped" and dev_is_idle():
+        return stop_fck_nat_instance()
+    return "WARP waiting"
 
 
 def start_dev_stack():
@@ -555,40 +621,51 @@ def wait_for_app_stopped():
     raise TimeoutError("앱 서버가 제한 시간 안에 ASG에서 제거되지 않았습니다.")
 
 
+def start_app_after_network():
+    action = START_APP_AFTER_NAT_ACTION
+    try:
+        if not load_active_teams():
+            raise StartCancelled()
+        rds_state = start_rds()
+        if rds_state not in {"available", "starting", "stopping"}:
+            return {"action": action, "status": "waiting", "rds": rds_state}
+        # RDS recovery runs while NAT/WARP become ready. The ASG's CodeDeploy
+        # launch hook starts the app, so capacity still waits for both checks.
+        nat_instance_id = wait_for_fck_nat_ready()
+        warp_instance_id = wait_for_network_ready(WARP_NAME, WARP_READINESS_DOCUMENT)
+        # An old stop may have reached RDS while network readiness was pending.
+        rds_state = get_rds_state()
+        if rds_state != "available":
+            return {"action": action, "status": "waiting", "rds": rds_state}
+        if not load_active_teams():
+            raise StartCancelled()
+    except StartCancelled:
+        # 취소된 시작 작업도 앱/WARP가 종료되기 전에 NAT를 정지하면 안 된다.
+        # 시작 대기로 timeout을 소진했을 수 있어 종료 대기는 별도 호출에서 수행한다.
+        invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
+        return {"action": action, "status": "cancelled", "reason": "종료 작업 예약"}
+    app_message = start_instance()
+    if "실패" in app_message or app_message.startswith("❌"):
+        raise RuntimeError(app_message)
+    return {
+        "action": action, "status": "completed",
+        "nat_instance_id": nat_instance_id, "warp_instance_id": warp_instance_id,
+        "app": app_message,
+    }
+
+
 def handle_internal_event(event):
     action = event.get("action")
     if action == RECONCILE_RDS_ACTION:
         return {"action": action, **reconcile_rds()}
     if action == START_APP_AFTER_NAT_ACTION:
+        etag = acquire_startup_lock()
+        if etag is None:
+            return {"action": action, "status": "busy"}
         try:
-            if not load_active_teams():
-                raise StartCancelled()
-            rds_state = start_rds()
-            if rds_state not in {"available", "starting", "stopping"}:
-                return {"action": action, "status": "waiting", "rds": rds_state}
-            # RDS recovery runs while NAT/WARP become ready. The ASG's CodeDeploy
-            # launch hook starts the app, so capacity still waits for both checks.
-            nat_instance_id = wait_for_fck_nat_ready()
-            warp_instance_id = wait_for_network_ready(WARP_NAME, WARP_READINESS_DOCUMENT)
-            # An old stop may have reached RDS while network readiness was pending.
-            rds_state = get_rds_state()
-            if rds_state != "available":
-                return {"action": action, "status": "waiting", "rds": rds_state}
-            if not load_active_teams():
-                raise StartCancelled()
-        except StartCancelled:
-            # 취소된 시작 작업도 앱/WARP가 종료되기 전에 NAT를 정지하면 안 된다.
-            # 시작 대기로 timeout을 소진했을 수 있어 종료 대기는 별도 호출에서 수행한다.
-            invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
-            return {"action": action, "status": "cancelled", "reason": "종료 작업 예약"}
-        app_message = start_instance()
-        if "실패" in app_message or app_message.startswith("❌"):
-            raise RuntimeError(app_message)
-        return {
-            "action": action, "status": "completed",
-            "nat_instance_id": nat_instance_id, "warp_instance_id": warp_instance_id,
-            "app": app_message,
-        }
+            return start_app_after_network()
+        finally:
+            release_startup_lock(etag)
     if action == STOP_NAT_AFTER_APP_ACTION:
         result = stop_network_after_app()
         if result["status"] == "completed":

@@ -95,6 +95,32 @@ class RdsLifecycleTest(unittest.TestCase):
         self.assertEqual(self.worker(main.RECONCILE_RDS_ACTION)["status"], "completed")
         self.assertEqual(main.rds_client.stop_calls, ["snorose-dev"])
 
+    def test_failed_build_without_app_is_cleaned_up_without_stop_grace_period(self):
+        main = self.main
+        main.s3_client.teams = []
+        main.ec2_client.state = "running"
+        self.worker(main.RECONCILE_RDS_ACTION)
+        self.assertEqual(main.rds_client.stop_calls, ["snorose-dev"])
+        self.assertEqual(main.ec2_client.stop_calls, [["i-fcknat"]])
+
+    def test_periodic_cleanup_waits_for_warp_before_stopping_nat(self):
+        main = self.main
+        main.s3_client.teams = []
+        main.ec2_client.state = main.ec2_client.warp_state = "running"
+        self.worker(main.RECONCILE_RDS_ACTION)
+        self.assertEqual(main.ec2_client.stop_calls, [["i-warp"]])
+        self.worker(main.RECONCILE_RDS_ACTION)
+        self.assertEqual(main.ec2_client.stop_calls, [["i-warp"], ["i-fcknat"]])
+
+    def test_another_deployment_protects_prepared_resources_after_build_failure(self):
+        main = self.main
+        main.s3_client.teams = []
+        main.ec2_client.state = "running"
+        self.lease()
+        self.worker(main.RECONCILE_RDS_ACTION)
+        self.assertEqual(main.ec2_client.stop_calls, [])
+        self.assertEqual(main.rds_client.stop_calls, [])
+
     def test_start_during_stopping_waits_then_restarts_database(self):
         main = self.main
         main.rds_client.state = "stopping"

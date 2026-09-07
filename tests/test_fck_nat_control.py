@@ -6,7 +6,10 @@ import pathlib
 import sys
 import unittest
 import time
+import hashlib
+import threading
 from types import SimpleNamespace
+from botocore.exceptions import ClientError
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -107,8 +110,16 @@ class FakeLambdaClient:
 class FakeS3Client:
     def __init__(self, teams):
         self.teams = teams
+        self.objects = {}
+        self.guard = threading.Lock()
 
     def get_object(self, Bucket, Key):
+        if Key == "dev-manager/startup-lock.json":
+            with self.guard:
+                if Key not in self.objects:
+                    raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+                body, etag = self.objects[Key]
+            return {"Body": io.BytesIO(body), "ETag": etag}
         body = json.dumps({"active_teams": self.teams}).encode()
         return {"Body": io.BytesIO(body)}
 
@@ -116,6 +127,17 @@ class FakeS3Client:
         return {"Contents": []}
 
     def put_object(self, **kwargs):
+        if kwargs["Key"] == "dev-manager/startup-lock.json":
+            with self.guard:
+                current = self.objects.get(kwargs["Key"])
+                if (kwargs.get("IfNoneMatch") == "*" and current is not None) or (
+                    "IfMatch" in kwargs and (current is None or current[1] != kwargs["IfMatch"])
+                ):
+                    raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+                body = kwargs["Body"].encode()
+                etag = hashlib.sha256(body).hexdigest()
+                self.objects[kwargs["Key"]] = (body, etag)
+                return {"ETag": etag}
         self.teams = json.loads(kwargs["Body"])["active_teams"]
 
 

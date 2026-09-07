@@ -69,8 +69,11 @@ fck-nat는 non-HA On-Demand 단일 인스턴스로 구성하며 WARP 및 앱 서
 `stop_dev`는 마지막 팀이 종료할 때 앱 ASG를 0으로 내리고, 앱이 모두 사라진 뒤 WARP·fck-nat와 RDS를 정지합니다.
 
 RDS 시작·정지는 수분 이상 걸릴 수 있어 한 Lambda 안에서 계속 기다리지 않습니다.
-`snorose-infra`의 EventBridge 규칙이 5분마다 `reconcile_rds`를 호출해 준비된 RDS 뒤의 앱 기동을 재개합니다.
-RDS 준비 완료부터 후속 작업까지 최대 약 5분이 더 걸릴 수 있으며, 이후 기존 앱 배포 시간이 필요합니다.
+`snorose-infra`의 EventBridge 규칙이 1분마다 `reconcile_rds`를 호출해 준비된 RDS 뒤의 앱 기동을 재개합니다.
+RDS 준비 완료부터 후속 작업까지 통상 다음 1분 주기에 수초의 스케줄 지연이 더해질 수 있으며, 이후 기존 앱 배포 시간이 필요합니다.
+기동 작업은 S3 `dev-manager/startup-lock.json`을 조건부로 작성해 중복 실행을 막습니다.
+잠금은 작업 종료 시 해제하며, Lambda 강제 종료 시에는 11분 후 다시 획득할 수 있습니다.
+이 잠금은 Lambda의 10분 실행 제한보다 길게 유지됩니다.
 `status_dev`는 RDS 상태도 표시합니다. RDS가 `available`이 아니면 앱을 새로 시작하지 않습니다.
 
 RDS는 7일간 정지하면 AWS가 자동으로 다시 시작합니다. 같은 규칙이 활성 팀이 없고 ASG desired=0이며
@@ -106,7 +109,7 @@ Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`�
 | `autoscaling:DescribeScalingActivities` | 스케일링 실패 원인 조회 |
 | `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus` | 인스턴스 상태 검사 |
 | `elasticloadbalancing:DescribeTargetHealth` | `status_dev`의 앱 헬스체크 |
-| `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일 및 배포 보호 기록 조회 |
+| `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일, 기동 잠금 및 배포 보호 기록 조회 |
 | `ssm:SendCommand`, `ssm:GetCommandInvocation` | 전용 NAT/WARP 문서를 실행하고 결과 확인 |
 | `lambda:InvokeFunction` | NAT 및 앱의 순차 시작·중지 작업을 비동기로 실행 |
 | `rds:DescribeDBInstances`, `rds:StartDBInstance`, `rds:StopDBInstance` | dev RDS `snorose-dev` 한 개의 준비 확인·시작·정지 |
@@ -138,26 +141,32 @@ SSM 진단 문서는 임의 명령 파라미터를 받지 않으며 다른 인�
 
 `Snorose-Server`의 기존 머지 후 자동 기동을 유지합니다. CD는 S3의
 `dev-manager/deployments/{run_id}-{attempt}.json`에 배포 보호 기록을 남긴 뒤 RDS를 시작합니다.
-CD도 RDS와 NAT 준비를 병렬로 진행하고, 두 작업이 모두 성공하면 앱 ASG 기동, CodeDeploy, 스모크 테스트를 진행합니다.
+CD는 빌드와 RDS·NAT 준비를 동시에 진행하고, 모두 성공하면 앱 ASG 기동, CodeDeploy, 스모크 테스트를 진행합니다.
+배포 작업 진입 시 보호 기록을 갱신하고 DB·네트워크 준비 상태를 다시 확인합니다.
 봇으로 먼저 dev를 켤 필요는 없습니다. CD는 활성 팀 목록을 수정하지 않습니다.
 
 ASG가 기동하면 CodeDeploy launch hook이 앱을 자동 배포하므로 ASG는 RDS와 병렬로 시작하지 않습니다.
 DB가 준비되기 전에 앱이 시작되면 현재 약 2분의 서비스 검증 제한에 걸릴 수 있습니다. ASG까지 병렬화하려면
-앱 시작 훅에 DB 대기를 먼저 추가해야 합니다. 현재 준비 시간은 `max(RDS 복구, NAT/WARP 준비) + 앱 기동`입니다.
+앱 시작 훅에 DB 대기를 먼저 추가해야 합니다. 봇의 준비 시간은 `max(RDS 복구, NAT/WARP 준비) + 앱 기동`입니다.
+CD에서는 빌드 시간도 겹쳐 `max(빌드, RDS 복구, NAT 준비) + 앱 기동` 순서로 진행합니다.
 
 유효한 배포 기록이 있으면 봇은 앱·네트워크·RDS를 종료하지 않습니다. 마지막 팀의 `/stop_dev`는
 팀 등록을 유지한 채 보류하고, 배포 후 다시 실행하도록 안내합니다. 배포와 스모크 테스트가 끝나면
 별도 정리 작업이 해당 실행의 기록만 삭제합니다. 중복 배포는 서로의 보호 기록을 삭제하지 않습니다.
 실행 취소나 불확실한 CodeDeploy 상태로 기록이 남아도 3시간 후 효력이 사라집니다.
-DEV 배포 작업은 최대 90분, 스모크 작업은 최대 30분으로 제한합니다.
+DEV 빌드는 최대 30분, 자원 준비는 25분, 배포는 90분, 스모크는 30분으로 제한합니다.
 기록을 읽거나 해석하지 못하면 종료하지 않습니다.
+
+빌드나 준비 단계가 실패해 앱 기동을 건너뛰면 CD는 해당 실행의 보호 기록을 삭제합니다.
+다음 주기에서 팀·다른 배포·앱이 모두 없는지 확인한 뒤 RDS를 정지하고 WARP → NAT 순서로 정리합니다.
+RDS에 별도의 15~30분 종료 유예를 두지 않습니다.
 
 CD만으로 켠 환경은 기존처럼 배포 후에도 켜져 있습니다. 앱 ASG desired가 1 이상이면 RDS도 유지합니다.
 사용 종료 시 `/stop_dev`로 환경을 정지하며, DB만 사용하는 작업은 `/start_dev`로 팀을 등록하세요.
 
 ## RDS 연동 배포 순서
 
-1. 연결된 인프라 PR에서 봇의 dev RDS 제어·배포 기록 조회 권한과 CD의 RDS 시작·배포 기록 생성/삭제 권한을 먼저 적용합니다.
+1. 연결된 인프라 PR에서 봇의 dev RDS 제어·배포 기록 조회·기동 잠금 Get/Put 권한과 CD의 RDS 시작·배포 기록 생성/삭제 권한을 먼저 적용합니다.
 2. 연결된 `Snorose-Server` PR을 배포해 RDS 자동 기동과 배포 종료 보호를 활성화합니다.
 3. 이 봇 PR을 `develop`에 머지해 Lambda에 배포합니다. 이 시점까지 dev를 켜 둡니다.
 4. 인프라 PR의 EventBridge 규칙·대상·Lambda 호출 권한을 적용합니다. 이전 봇에는 `reconcile_rds`가 없으므로 코드 배포보다 먼저 규칙을 활성화하지 않습니다.
@@ -167,7 +176,8 @@ CD만으로 켠 환경은 기존처럼 배포 후에도 켜져 있습니다. 앱
 EventBridge 규칙이 필요하므로 봇 코드만 배포한 상태를 최종 구성으로 두면 안 됩니다.
 
 복구할 때는 먼저 EventBridge 규칙을 비활성화하고 RDS를 available로 만든 뒤 이전 봇 이미지를 배포합니다.
-RDS 데이터베이스를 삭제하거나 재생성할 필요는 없습니다. S3 상태와 AWS 제어 사이에 분산 잠금은 없으므로,
+RDS 데이터베이스를 삭제하거나 재생성할 필요는 없습니다. 기동 작업의 중복은 S3 잠금으로 막지만,
+팀·배포 상태 조회와 모든 AWS 시작·정지를 하나의 트랜잭션으로 묶지는 않으므로,
 마지막 종료와 새 시작이 동시에 발생하면 RDS stopping 완료 후 다음 주기에 재시작될 수 있습니다.
 
 ## Discord 응답 시간

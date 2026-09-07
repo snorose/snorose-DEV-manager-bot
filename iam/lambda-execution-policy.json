@@ -128,6 +128,15 @@
           "s3:prefix": "dev-manager/deployments/*"
         }
       }
+    },
+    {
+      "Sid": "ManageDevStartupLock",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::snorose-dev-bucket/dev-manager/startup-lock.json"
     }
   ]
 }

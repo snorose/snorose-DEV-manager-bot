@@ -36,3 +36,8 @@ capacity로 제어하고, `StartInstances` / `StopInstances`는 fck-nat 및 WARP
 배포 종료 보호에는 `dev-manager/deployments/*`의 `s3:GetObject`와 해당 prefix의 `s3:ListBucket`이 필요합니다.
 봇은 CD가 작성한 만료 시각을 읽기만 합니다. CD 역할의 dev RDS Describe/Start와 배포 기록 Put/Delete 권한은
 `snorose-infra`의 dev 전용 `app_deploy_rds` 정책에서 관리합니다. 두 역할의 권한을 먼저 적용한 뒤 코드를 배포합니다.
+
+기동 작업의 중복 방지에는 `dev-manager/startup-lock.json` 한 개의 Get/Put만 추가합니다.
+`If-None-Match: *`로 최초 잠금을 생성하고, 만료된 잠금의 교체와 해제에는 `If-Match`를 사용합니다.
+잠금 삭제나 버킷 전체 조회 권한은 필요하지 않습니다.
+[AWS S3 조건부 쓰기](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
