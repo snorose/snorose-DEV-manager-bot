@@ -16,7 +16,10 @@ aws iam put-role-policy \
   --policy-document file://iam/lambda-execution-policy.json
 ```
 
-Describe 계열 API는 리소스 단위 권한을 지원하지 않아 `Resource: "*"`입니다.
+EC2·ASG·ELB의 Describe 계열 API는 `Resource: "*"`입니다.
+RDS의 `DescribeDBInstances`, `StartDBInstance`, `StopDBInstance`는
+`arn:aws:rds:ap-northeast-2:621962613485:db:snorose-dev` 한 개로 제한합니다.
+DB 삭제·변경·비밀번호 조회 권한은 추가하지 않습니다.
 쓰기 권한은 DEV 앱 ASG와 `Name=snorose-dev-an2-fck-nat` / `Name=WARPConnector-dev`인 EC2 인스턴스로 한정되어 있습니다.
 NAT 준비와 앱 종료를 Discord 응답과 분리하기 위해 봇 Lambda가 자기 자신을 비동기로
 호출할 수 있는 권한도 포함합니다.
@@ -29,3 +32,7 @@ capacity로 제어하고, `StartInstances` / `StopInstances`는 fck-nat 및 WARP
 실행할 수 있는 `ssm:SendCommand` 및 `ssm:GetCommandInvocation`이 필요합니다.
 임의 셸 명령을 받는 `AWS-RunShellScript` 실행 권한은 없습니다. Terraform 정책은
 인스턴스 ARN으로 제한하며, 이 참조 JSON은 배포 전에 아직 모르는 인스턴스 ID를 Name 태그로 제한합니다.
+
+배포 종료 보호에는 `dev-manager/deployments/*`의 `s3:GetObject`와 해당 prefix의 `s3:ListBucket`이 필요합니다.
+봇은 CD가 작성한 만료 시각을 읽기만 합니다. CD 역할의 dev RDS Describe/Start와 배포 기록 Put/Delete 권한은
+`snorose-infra`의 dev 전용 `app_deploy_rds` 정책에서 관리합니다. 두 역할의 권한을 먼저 적용한 뒤 코드를 배포합니다.

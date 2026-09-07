@@ -50,7 +50,7 @@ DEV 서버의 상태를 조회하는 명령어입니다.
 1. AWS에 Lambda 함수, ECR Repository, GitHub OIDC용 IAM Role을 미리 준비합니다.
 2. GitHub Environment는 `DEV`만 사용합니다. 배포 워크플로의 환경도 `DEV`로 고정합니다.
 3. 각 Environment variable에 ```AWS_ROLE_ARN```, ```AWS_REGION```, ```ECR_REPOSITORY_NAME```, ```LAMBDA_FUNCTION_NAME```, ```DISCORD_PUBLIC_KEY```, ```DISCORD_APPLICATION_ID```를 설정합니다.
-   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```은 생략하면 DEV 기본값이 쓰입니다.
+   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```, ```RDS_INSTANCE_IDENTIFIER```는 생략하면 DEV 기본값이 쓰입니다.
    Lambda 환경변수는 워크플로가 맵 전체를 덮어쓰므로, 콘솔에서 직접 추가하면 다음 배포 때 사라집니다.
 4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다.
 5. `develop` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
@@ -64,8 +64,19 @@ desired capacity를 1↔0으로 조정합니다. 스팟 인스턴스는 one-time
 `StopInstances`가 불가능하고, ASG 소속 인스턴스는 stop해도 ASG가 다시 교체하기 때문입니다.
 
 fck-nat는 non-HA On-Demand 단일 인스턴스로 구성하며 WARP 및 앱 서버와 함께 제어합니다.
-`start_dev`는 NAT 준비 확인 → WARP 준비 확인 → 앱 ASG desired capacity 1 순서로 실행합니다.
-`stop_dev`는 앱 ASG가 비워지고 WARP가 정지된 뒤 fck-nat를 정지합니다.
+`start_dev`는 dev RDS를 시작하고, RDS `available` → NAT 준비 확인 → WARP 준비 확인 → 앱 ASG desired capacity 1 순서로 진행합니다.
+`stop_dev`는 마지막 팀이 종료할 때 앱 ASG를 0으로 내리고, 앱이 모두 사라진 뒤 WARP·fck-nat와 RDS를 정지합니다.
+
+RDS 시작·정지는 수분 이상 걸릴 수 있어 한 Lambda 안에서 계속 기다리지 않습니다.
+`snorose-infra`의 EventBridge 규칙이 5분마다 `reconcile_rds`를 호출해 준비된 RDS 뒤의 앱 기동을 재개합니다.
+RDS 준비 완료부터 후속 작업까지 최대 약 5분이 더 걸릴 수 있으며, 이후 기존 앱 배포 시간이 필요합니다.
+`status_dev`는 RDS 상태도 표시합니다. RDS가 `available`이 아니면 앱을 새로 시작하지 않습니다.
+
+RDS는 7일간 정지하면 AWS가 자동으로 다시 시작합니다. 같은 규칙이 활성 팀이 없고 ASG desired=0이며
+앱 인스턴스도 없는 것을 확인한 뒤 RDS를 다시 정지합니다. 팀 상태 파일 누락·손상·조회 실패 시에는
+DB를 정지하지 않습니다. ASG가 수동으로 켜진 경우에도 DB를 유지합니다.
+데이터·DB 식별자·접속 주소는 보존되며 스토리지와 백업 비용은 계속 발생합니다.
+[AWS RDS 정지 문서](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_StopInstance.html)
 
 준비 확인은 EC2 상태 검사와 인프라 PR #26이 생성하는 전용 SSM 문서를 사용합니다.
 NAT는 설정 실행 완료, ENI, forwarding, MASQUERADE 및 EIP를 통한 HTTPS 통신을 확인합니다.
@@ -94,9 +105,10 @@ Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`�
 | `autoscaling:DescribeScalingActivities` | 스케일링 실패 원인 조회 |
 | `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus` | 인스턴스 상태 검사 |
 | `elasticloadbalancing:DescribeTargetHealth` | `status_dev`의 앱 헬스체크 |
-| `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일 |
+| `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일 및 배포 보호 기록 조회 |
 | `ssm:SendCommand`, `ssm:GetCommandInvocation` | 전용 NAT/WARP 문서를 실행하고 결과 확인 |
 | `lambda:InvokeFunction` | NAT 및 앱의 순차 시작·중지 작업을 비동기로 실행 |
+| `rds:DescribeDBInstances`, `rds:StartDBInstance`, `rds:StopDBInstance` | dev RDS `snorose-dev` 한 개의 준비 확인·시작·정지 |
 
 앱 헬스체크는 인스턴스에 직접 HTTP 요청을 보내지 않고 ALB Target Group의 판정을 읽습니다.
 앱 서버가 private subnet에 있어 public IP가 없고, Lambda도 VPC 밖이라 직접 접근이 불가능합니다.
@@ -104,10 +116,7 @@ Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`�
 ## 테스트 실행
 
 ```bash
-python tests/test_active_teams_state.py
-python tests/test_asg_control.py
-python tests/test_fck_nat_control.py
-python tests/test_runtime_config.py
+python -m unittest discover -s tests -v
 ```
 
 
@@ -118,10 +127,43 @@ python tests/test_runtime_config.py
 | `WARP_NAME` | `WARPConnector-dev` |
 | `NAT_READINESS_DOCUMENT` | `snorose-dev-fck-nat-ready` |
 | `WARP_READINESS_DOCUMENT` | `snorose-dev-warp-ready` |
+| `RDS_INSTANCE_IDENTIFIER` | `snorose-dev` |
 
 인프라 PR #26의 SSM 문서와 IAM 권한을 먼저 적용한 뒤 이 봇을 배포해야 합니다.
 SSM 진단 문서는 임의 명령 파라미터를 받지 않으며 다른 인스턴스에 대한 실행 권한도 부여하지 않습니다.
 기존 NAT Gateway 상태에서는 이 봇의 새 시작 절차를 사용할 수 없습니다.
+
+## 자동 배포와 종료 보호
+
+`Snorose-Server`의 기존 머지 후 자동 기동을 유지합니다. CD는 S3의
+`dev-manager/deployments/{run_id}-{attempt}.json`에 배포 보호 기록을 남긴 뒤 RDS를 시작합니다.
+RDS가 `available`이 되면 기존 NAT 준비 확인과 앱 ASG 기동, CodeDeploy, 스모크 테스트를 진행합니다.
+봇으로 먼저 dev를 켤 필요는 없습니다. CD는 활성 팀 목록을 수정하지 않습니다.
+
+유효한 배포 기록이 있으면 봇은 앱·네트워크·RDS를 종료하지 않습니다. 마지막 팀의 `/stop_dev`는
+팀 등록을 유지한 채 보류하고, 배포 후 다시 실행하도록 안내합니다. 배포와 스모크 테스트가 끝나면
+별도 정리 작업이 해당 실행의 기록만 삭제합니다. 중복 배포는 서로의 보호 기록을 삭제하지 않습니다.
+실행 취소나 불확실한 CodeDeploy 상태로 기록이 남아도 3시간 후 효력이 사라집니다.
+DEV 배포 작업은 최대 90분, 스모크 작업은 최대 30분으로 제한합니다.
+기록을 읽거나 해석하지 못하면 종료하지 않습니다.
+
+CD만으로 켠 환경은 기존처럼 배포 후에도 켜져 있습니다. 앱 ASG desired가 1 이상이면 RDS도 유지합니다.
+사용 종료 시 `/stop_dev`로 환경을 정지하며, DB만 사용하는 작업은 `/start_dev`로 팀을 등록하세요.
+
+## RDS 연동 배포 순서
+
+1. 연결된 인프라 PR에서 봇의 dev RDS 제어·배포 기록 조회 권한과 CD의 RDS 시작·배포 기록 생성/삭제 권한을 먼저 적용합니다.
+2. 연결된 `Snorose-Server` PR을 배포해 RDS 자동 기동과 배포 종료 보호를 활성화합니다.
+3. 이 봇 PR을 `develop`에 머지해 Lambda에 배포합니다. 이 시점까지 dev를 켜 둡니다.
+4. 인프라 PR의 EventBridge 규칙·대상·Lambda 호출 권한을 적용합니다. 이전 봇에는 `reconcile_rds`가 없으므로 코드 배포보다 먼저 규칙을 활성화하지 않습니다.
+5. 팀 사용이 끝난 뒤 `/stop_dev`와 `/start_dev`, 정지된 dev에 대한 자동 배포로 실제 RDS 정지·재기동을 검증합니다.
+
+권한을 먼저 적용할 때는 인프라 저장소의 적용 안내를 따릅니다. 장시간 준비 작업을 재개하려면
+EventBridge 규칙이 필요하므로 봇 코드만 배포한 상태를 최종 구성으로 두면 안 됩니다.
+
+복구할 때는 먼저 EventBridge 규칙을 비활성화하고 RDS를 available로 만든 뒤 이전 봇 이미지를 배포합니다.
+RDS 데이터베이스를 삭제하거나 재생성할 필요는 없습니다. S3 상태와 AWS 제어 사이에 분산 잠금은 없으므로,
+마지막 종료와 새 시작이 동시에 발생하면 RDS stopping 완료 후 다음 주기에 재시작될 수 있습니다.
 
 ## Discord 응답 시간
 
