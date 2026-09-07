@@ -45,15 +45,15 @@ DEV 서버의 상태를 조회하는 명령어입니다.
 
 ## 배포 방법
 
-GitHub Actions가 ```develop```, ```main``` 브랜치 push를 감지해 Docker 이미지를 빌드하고 ECR에 push한 뒤 Lambda 함수 이미지를 업데이트합니다.
+기본 브랜치는 `develop`이며, 작업 브랜치에서 PR을 만들어 `develop`에 머지합니다. GitHub Actions는 `develop` push만 감지해 AWS dev 계정의 ECR에 이미지를 올리고 Lambda 함수를 업데이트합니다. `main`은 사용하지 않으며 배포를 실행하지 않습니다.
 
 1. AWS에 Lambda 함수, ECR Repository, GitHub OIDC용 IAM Role을 미리 준비합니다.
-2. GitHub Environment를 설정합니다. ```develop``` 브랜치는 ```DEV```, ```main``` 브랜치는 ```PROD``` Environment를 사용합니다.
+2. GitHub Environment는 `DEV`만 사용합니다. 배포 워크플로의 환경도 `DEV`로 고정합니다.
 3. 각 Environment variable에 ```AWS_ROLE_ARN```, ```AWS_REGION```, ```ECR_REPOSITORY_NAME```, ```LAMBDA_FUNCTION_NAME```, ```DISCORD_PUBLIC_KEY```, ```DISCORD_APPLICATION_ID```를 설정합니다.
    ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```은 생략하면 DEV 기본값이 쓰입니다.
    Lambda 환경변수는 워크플로가 맵 전체를 덮어쓰므로, 콘솔에서 직접 추가하면 다음 배포 때 사라집니다.
 4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다.
-5. ```develop``` 또는 ```main``` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
+5. `develop` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
 6. Lambda Function URL에 ```/interactions```를 붙여 [디스코드 개발자 포털](https://discord.com/developers/applications)의 General Information > Interactions Endpoint URL에 입력합니다.
 7. 배포 뒤 Lambda 실행 역할에 아래 "필요 IAM 권한"의 정책을 부여합니다.
 
