@@ -796,7 +796,7 @@ def handle_status_dev():
         return msg
 
     if instance_state == "stopped" and (active_teams or rds_state != "stopped" or nat_state in {"pending", "running", "stopping"} or warp_state in {"pending", "running", "stopping"}):
-        if active_teams:
+        if active_teams or has_active_deployment():
             return (
                 "⏳ DEV 서버가 시작 중입니다. (RDS와 네트워크 준비 확인 후 앱 서버 시작)"
                 f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}\nRDS: {rds_state}"

@@ -213,6 +213,19 @@ class RdsLifecycleTest(unittest.TestCase):
         self.assertEqual(main.asg_client.set_calls, [])
         self.assertEqual(main.rds_client.stop_calls, [])
 
+    def test_status_recognizes_cd_start_without_registered_teams(self):
+        main = self.main
+        self.lease()
+        main.s3_client.teams = []
+        main.rds_client.state = "starting"
+        main.get_instance_state = lambda: "stopped"
+        main.get_instance_status = lambda: ""
+        main.get_fck_nat_state = main.get_warp_state = lambda: "stopped"
+        message = main.handle_status_dev()
+        self.assertIn("시작 중", message)
+        self.assertIn("RDS: starting", message)
+        self.assertNotIn("중지 중", message)
+
     def test_deployment_cancels_an_old_network_stop_worker(self):
         main = self.main
         self.lease()
