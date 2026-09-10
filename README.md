@@ -75,7 +75,7 @@ Discord로 전달하지 않으며, 검사 때문에 서비스를 시작·재시�
 1. AWS에 Lambda 함수, ECR Repository, GitHub OIDC용 IAM Role을 미리 준비합니다.
 2. GitHub Environment는 `DEV`만 사용합니다. 배포 워크플로의 환경도 `DEV`로 고정합니다.
 3. 각 Environment variable에 ```AWS_ROLE_ARN```, ```AWS_REGION```, ```ECR_REPOSITORY_NAME```, ```LAMBDA_FUNCTION_NAME```, ```DISCORD_PUBLIC_KEY```, ```DISCORD_APPLICATION_ID```를 설정합니다.
-   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```, ```RDS_INSTANCE_IDENTIFIER```, ```REDIS_READINESS_DOCUMENT```는 생략하면 DEV 기본값이 쓰입니다.
+   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```, ```RDS_INSTANCE_IDENTIFIER```, ```REDIS_READINESS_DOCUMENT```, ```PENDING_RECONCILE_RULE```는 GitHub 변수에서 생략하면 배포 워크플로의 DEV 기본값이 쓰입니다.
    Lambda 환경변수는 워크플로가 맵 전체를 덮어쓰므로, 콘솔에서 직접 추가하면 다음 배포 때 사라집니다.
 4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다.
 5. `develop` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
@@ -94,12 +94,25 @@ fck-nat는 non-HA On-Demand 단일 인스턴스로 구성하며 WARP 및 앱 서
 `stop_dev`는 마지막 팀이 종료할 때 앱 ASG를 0으로 내리고, 앱이 모두 사라진 뒤 WARP·fck-nat와 RDS를 정지합니다.
 
 RDS 시작·정지는 수분 이상 걸릴 수 있어 한 Lambda 안에서 계속 기다리지 않습니다.
-`snorose-infra`의 EventBridge 규칙이 1분마다 `reconcile_rds`를 호출해 준비된 RDS 뒤의 앱 기동을 재개합니다.
-RDS 준비 완료부터 후속 작업까지 통상 다음 1분 주기에 수초의 스케줄 지연이 더해질 수 있으며, 이후 기존 앱 배포 시간이 필요합니다.
+`snorose-infra`는 RDS 상태 이벤트와 작업 중에만 켜지는 1분 규칙으로 `reconcile_rds`를 호출합니다.
+이벤트를 놓치거나 후속 작업이 실패한 경우에는 15분 주기의 상시 확인이 복구합니다. 정상 정지·운영 중에는
+1분 규칙을 끄므로 기본 호출은 하루 96회입니다. 작업 중 호출·RDS 이벤트·재시도는 별도입니다.
+RDS 준비 완료 후 이벤트 또는 다음 1분 주기와 AWS 전달 지연을 거쳐 앱 기동을 재개하며, 이후 앱 배포 시간이 필요합니다.
 기동 작업은 S3 `dev-manager/startup-lock.json`을 조건부로 작성해 중복 실행을 막습니다.
 잠금은 작업 종료 시 해제하며, Lambda 강제 종료 시에는 11분 후 다시 획득할 수 있습니다.
 이 잠금은 Lambda의 10분 실행 제한보다 길게 유지됩니다.
 `status_dev`는 RDS 상태도 표시합니다. RDS가 `available`이 아니면 앱을 새로 시작하지 않습니다.
+
+빠른 확인 규칙은 `PENDING_RECONCILE_RULE`(배포 기본값 `snorose-dev-manager-bot-rds-pending`)입니다.
+시작 시에는 팀 등록 후, 종료 시에는 ASG desired=0 요청 성공 후 활성화합니다. 팀의 앱 기동 대기,
+RDS 상태 전환, 유효한 배포 보호 기록, 남아 있는 앱·네트워크 정리 작업이 있으면 유지합니다.
+정상 상태가 되면 규칙을 끄고 현재 상태를 재조회해 그 사이 들어온 시작·종료 요청을 놓치지 않도록 다시 켭니다.
+재조회 실패 시에도 다시 켭니다. AWS API 반영 지연·실패까지 포함한 분산 트랜잭션은 아니므로
+15분 상시 확인은 제거하지 않습니다. 이 변수 없이 실행하는 이전 설정은 기존 주기 실행만 사용합니다.
+
+RDS 이벤트는 종료 명령이 아니라 현재 상태를 다시 확인하는 계기입니다. 다른 팀·배포·앱이 있으면
+DB를 정지하지 않는 기존 보호를 유지합니다. 이벤트 전달과 빠른 규칙 제어가 실패하면 복구나 잔여 자원 정리는
+다음 15분 주기까지 지연될 수 있습니다. 별도의 종료 유예를 추가한 것은 아닙니다.
 
 RDS는 7일간 정지하면 AWS가 자동으로 다시 시작합니다. 같은 규칙이 활성 팀이 없고 ASG desired=0이며
 앱 인스턴스도 없는 것을 확인한 뒤 RDS를 다시 정지합니다. 팀 상태 파일 누락·손상·조회 실패 시에는
@@ -137,6 +150,7 @@ Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`�
 | `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일, 기동 잠금 및 배포 보호 기록 조회 |
 | `ssm:SendCommand`, `ssm:GetCommandInvocation` | 전용 NAT/WARP/로컬 Redis 문서를 실행하고 결과 확인 |
 | `lambda:InvokeFunction` | NAT 및 앱의 순차 시작·중지 작업을 비동기로 실행 |
+| `events:EnableRule`, `events:DisableRule` | 작업 중 확인 규칙 한 개의 활성화·비활성화 |
 | `rds:DescribeDBInstances`, `rds:StartDBInstance`, `rds:StopDBInstance` | dev RDS `snorose-dev` 한 개의 준비 확인·시작·정지 |
 
 앱 헬스체크는 인스턴스에 직접 HTTP 요청을 보내지 않고 ALB Target Group의 판정을 읽습니다.
@@ -191,16 +205,17 @@ CD만으로 켠 환경은 기존처럼 배포 후에도 켜져 있습니다. 앱
 
 ## RDS 연동 배포 순서
 
-1. 연결된 인프라 PR에서 봇의 dev RDS 제어·배포 기록 조회·기동 잠금 Get/Put 권한과 CD의 RDS 시작·배포 기록 생성/삭제 권한을 먼저 적용합니다.
+1. 연결된 인프라 PR에서 봇/CD의 RDS·배포 기록·기동 잠금 권한과 `manager_bot_pending_reconcile` 정책을 먼저 적용합니다. 이 단계에서 작업 중 확인 규칙도 생성되지만 초기에는 비활성화되고 대상은 연결하지 않습니다.
 2. 연결된 `Snorose-Server` PR을 배포해 RDS 자동 기동과 배포 종료 보호를 활성화합니다.
 3. 이 봇 PR을 `develop`에 머지해 Lambda에 배포합니다. 이 시점까지 dev를 켜 둡니다.
-4. 인프라 PR의 EventBridge 규칙·대상·Lambda 호출 권한을 적용합니다. 이전 봇에는 `reconcile_rds`가 없으므로 코드 배포보다 먼저 규칙을 활성화하지 않습니다.
+4. 인프라 PR의 15분 상시 확인·1분 작업 중 확인·RDS 이벤트 규칙, 대상, Lambda 호출 권한을 적용합니다. 이전 봇에는 `reconcile_rds`가 없으므로 코드 배포보다 먼저 이벤트 전달을 활성화하지 않습니다.
 5. 팀 사용이 끝난 뒤 `/stop_dev`와 `/start_dev`, 정지된 dev에 대한 자동 배포로 실제 RDS 정지·재기동을 검증합니다.
 
 권한을 먼저 적용할 때는 인프라 저장소의 적용 안내를 따릅니다. 장시간 준비 작업을 재개하려면
 EventBridge 규칙이 필요하므로 봇 코드만 배포한 상태를 최종 구성으로 두면 안 됩니다.
 
-복구할 때는 먼저 EventBridge 규칙을 비활성화하고 RDS를 available로 만든 뒤 이전 봇 이미지를 배포합니다.
+RDS 연동 전으로 복구할 때는 먼저 EventBridge 규칙 세 개를 모두 비활성화하고 RDS를 available로 만든 뒤 이전 봇 이미지를 배포합니다.
+RDS 연동은 유지하면서 이번 주기 제어만 되돌린다면, 상시 규칙을 먼저 1분으로 복원한 뒤 이전 RDS 봇 코드를 배포합니다.
 RDS 데이터베이스를 삭제하거나 재생성할 필요는 없습니다. 기동 작업의 중복은 S3 잠금으로 막지만,
 팀·배포 상태 조회와 모든 AWS 시작·정지를 하나의 트랜잭션으로 묶지는 않으므로,
 마지막 종료와 새 시작이 동시에 발생하면 RDS stopping 완료 후 다음 주기에 재시작될 수 있습니다.

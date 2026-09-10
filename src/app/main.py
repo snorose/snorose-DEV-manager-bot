@@ -23,6 +23,7 @@ NAT_READINESS_DOCUMENT = os.environ.get("NAT_READINESS_DOCUMENT", "snorose-dev-f
 WARP_READINESS_DOCUMENT = os.environ.get("WARP_READINESS_DOCUMENT", "snorose-dev-warp-ready")
 REDIS_READINESS_DOCUMENT = os.environ.get("REDIS_READINESS_DOCUMENT", "snorose-dev-redis-ready")
 RDS_INSTANCE_IDENTIFIER = os.environ.get("RDS_INSTANCE_IDENTIFIER", "snorose-dev")
+PENDING_RECONCILE_RULE = os.environ.get("PENDING_RECONCILE_RULE")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
@@ -69,6 +70,7 @@ elbv2_client = None
 lambda_client = None
 ssm_client = None
 rds_client = None
+events_client = None
 
 
 class ActiveTeamsStateError(Exception):
@@ -163,6 +165,57 @@ def get_rds_client():
             config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 2}),
         )
     return rds_client
+
+
+def get_events_client():
+    global events_client
+
+    if events_client is None:
+        import boto3
+        from botocore.config import Config
+
+        events_client = boto3.client(
+            "events", region_name=AWS_REGION,
+            config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 2}),
+        )
+    return events_client
+
+
+def set_pending_reconcile(enabled):
+    # An unset rule keeps compatibility until the Terraform/IAM rollout is ready.
+    if PENDING_RECONCILE_RULE:
+        operation = "enable_rule" if enabled else "disable_rule"
+        getattr(get_events_client(), operation)(Name=PENDING_RECONCILE_RULE)
+
+
+def needs_fast_reconcile():
+    teams = load_active_teams(require_existing=True)
+    asg = get_asg()
+    if has_active_deployment():
+        return True
+    rds_state = get_rds_state()
+    if teams or asg["DesiredCapacity"] > 0:
+        return rds_state != "available" or asg["DesiredCapacity"] == 0
+    return (bool(asg.get("Instances")) or rds_state != "stopped"
+            or get_warp_state() != "stopped" or get_fck_nat_state() != "stopped")
+
+
+def sync_reconcile_schedule():
+    if not PENDING_RECONCILE_RULE:
+        return
+    if needs_fast_reconcile():
+        set_pending_reconcile(True)
+        return
+    set_pending_reconcile(False)
+    # Start/stop records its intent before enabling the rule. Re-read after disable
+    # so an older reconciliation cannot leave a concurrent request without fast checks.
+    try:
+        pending = needs_fast_reconcile()
+    except Exception:
+        set_pending_reconcile(True)
+        raise
+    if pending:
+        set_pending_reconcile(True)
 
 
 def normalize_active_teams(teams):
@@ -506,6 +559,8 @@ def reconcile_idle_network():
 
 def start_dev_stack():
     try:
+        # handle_start_dev has already persisted the team's intent to start.
+        set_pending_reconcile(True)
         rds_state = start_rds()
         nat_message = start_fck_nat_instance()
         invoke_background_action(START_APP_AFTER_NAT_ACTION)
@@ -527,9 +582,11 @@ def stop_dev_stack():
         return app_message
 
     try:
+        # Enable only after desired=0 is visible to concurrent reconcilers.
+        set_pending_reconcile(True)
         invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
     except Exception as e:
-        return f"{app_message}\n❌ fck-nat 중지 예약 실패: {e}"
+        return f"{app_message}\n❌ DEV 후속 정리 예약 실패: {e}"
 
     return f"{app_message}\n🛑 앱 서버가 종료되면 WARP·fck-nat와 RDS를 중지합니다."
 
@@ -659,7 +716,9 @@ def start_app_after_network():
 def handle_internal_event(event):
     action = event.get("action")
     if action == RECONCILE_RDS_ACTION:
-        return {"action": action, **reconcile_rds()}
+        result = reconcile_rds()
+        sync_reconcile_schedule()
+        return {"action": action, **result}
     if action == START_APP_AFTER_NAT_ACTION:
         etag = acquire_startup_lock()
         if etag is None:

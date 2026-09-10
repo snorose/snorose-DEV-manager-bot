@@ -49,4 +49,9 @@ Redis를 정상으로 표시하지 않고 확인 불가로 안내합니다.
 기동 작업의 중복 방지에는 `dev-manager/startup-lock.json` 한 개의 Get/Put만 추가합니다.
 `If-None-Match: *`로 최초 잠금을 생성하고, 만료된 잠금의 교체와 해제에는 `If-Match`를 사용합니다.
 잠금 삭제나 버킷 전체 조회 권한은 필요하지 않습니다.
+
+점검 호출을 줄이기 위해 `snorose-dev-manager-bot-rds-pending` 규칙 한 개의
+`events:EnableRule`·`events:DisableRule`을 허용합니다. 규칙이나 대상을 생성·수정할 권한과
+15분 상시 확인·RDS 이벤트 규칙을 끌 권한은 없습니다. 실제 정책은 dev의
+`manager_bot_pending_reconcile`에서 관리하며, 규칙·권한을 봇 코드보다 먼저 적용합니다.
 [AWS S3 조건부 쓰기](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)

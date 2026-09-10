@@ -145,6 +145,12 @@
       }
     },
     {
+      "Sid": "TogglePendingDevReconcile",
+      "Effect": "Allow",
+      "Action": ["events:EnableRule", "events:DisableRule"],
+      "Resource": "arn:aws:events:ap-northeast-2:621962613485:rule/snorose-dev-manager-bot-rds-pending"
+    },
+    {
       "Sid": "ManageDevStartupLock",
       "Effect": "Allow",
       "Action": [
