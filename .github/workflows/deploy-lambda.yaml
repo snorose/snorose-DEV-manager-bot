@@ -78,6 +78,7 @@ jobs:
             FCK_NAT_NAME=${{ vars.FCK_NAT_NAME || 'snorose-dev-an2-fck-nat' }}, \
             WARP_NAME=${{ vars.WARP_NAME || 'WARPConnector-dev' }}, \
             RDS_INSTANCE_IDENTIFIER=${{ vars.RDS_INSTANCE_IDENTIFIER || 'snorose-dev' }}, \
+            PENDING_RECONCILE_RULE=${{ vars.PENDING_RECONCILE_RULE || 'snorose-dev-manager-bot-rds-pending' }}, \
             NAT_READINESS_DOCUMENT=${{ vars.NAT_READINESS_DOCUMENT || 'snorose-dev-fck-nat-ready' }}, \
             WARP_READINESS_DOCUMENT=${{ vars.WARP_READINESS_DOCUMENT || 'snorose-dev-warp-ready' }} \
           }"
