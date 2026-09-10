@@ -97,6 +97,21 @@
       }
     },
     {
+      "Sid": "UseDevRedisReadinessDocument",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:ap-northeast-2:621962613485:document/snorose-dev-redis-ready"
+    },
+    {
+      "Sid": "CheckDevAppRedis",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:ap-northeast-2:621962613485:instance/*",
+      "Condition": {
+        "StringEquals": { "ssm:resourceTag/Name": "snorose-dev" }
+      }
+    },
+    {
       "Sid": "ReadDevReadinessResult",
       "Effect": "Allow",
       "Action": "ssm:GetCommandInvocation",
