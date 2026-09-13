@@ -4,7 +4,8 @@
 `snorose-dev-manager-bot-lambda-execution-role`의 인라인 정책
 `dev-manager-bot-lambda-execution-policy` 내용입니다.
 
-정책의 기준 정의는 `snorose-infra`의 `modules/iam`에 있습니다. 이 파일은 봇 저장소에서
+정책의 기준 정의는 `snorose-infra`의 `terraform/modules/iam` 및 dev 전용
+`terraform/envs/dev/local_redis_status.tf`에 있습니다. 이 파일은 봇 저장소에서
 필요 권한을 함께 검토하거나 IaC 반영 전 임시로 적용할 때 사용합니다.
 
 ```bash
@@ -32,6 +33,14 @@ capacity로 제어하고, `StartInstances` / `StopInstances`는 fck-nat 및 WARP
 실행할 수 있는 `ssm:SendCommand` 및 `ssm:GetCommandInvocation`이 필요합니다.
 임의 셸 명령을 받는 `AWS-RunShellScript` 실행 권한은 없습니다. Terraform 정책은
 인스턴스 ARN으로 제한하며, 이 참조 JSON은 배포 전에 아직 모르는 인스턴스 ID를 Name 태그로 제한합니다.
+
+로컬 Redis 상태에는 추가로 `snorose-dev-redis-ready` 문서와 `Name=snorose-dev`인 앱 EC2의
+`ssm:SendCommand` 권한을 사용합니다. ASG 교체에 따라 EC2 ID가 바뀌므로 태그로 범위를 제한합니다.
+전체 정책에서 허용되는 명령은 이 세 가지 고정 진단 문서뿐이며 임의 명령 파라미터는 없습니다.
+Redis 진단은 서비스를 재시작하지 않고 임시 키의 읽기·쓰기·TTL을 검사한 뒤 삭제합니다.
+인프라 #31의 문서·IAM을 먼저 적용한 뒤 봇을 배포합니다. 권한이나 문서가 없으면 `/status_dev`는
+Redis를 정상으로 표시하지 않고 확인 불가로 안내합니다.
+[AWS Run Command 태그 기반 권한](https://docs.aws.amazon.com/systems-manager/latest/userguide/run-command-setting-up.html)
 
 배포 종료 보호에는 `dev-manager/deployments/*`의 `s3:GetObject`와 해당 prefix의 `s3:ListBucket`이 필요합니다.
 봇은 CD가 작성한 만료 시각을 읽기만 합니다. CD 역할의 dev RDS Describe/Start와 배포 기록 Put/Delete 권한은

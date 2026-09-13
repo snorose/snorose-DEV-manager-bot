@@ -80,7 +80,8 @@ jobs:
             RDS_INSTANCE_IDENTIFIER=${{ vars.RDS_INSTANCE_IDENTIFIER || 'snorose-dev' }}, \
             PENDING_RECONCILE_RULE=${{ vars.PENDING_RECONCILE_RULE || 'snorose-dev-manager-bot-rds-pending' }}, \
             NAT_READINESS_DOCUMENT=${{ vars.NAT_READINESS_DOCUMENT || 'snorose-dev-fck-nat-ready' }}, \
-            WARP_READINESS_DOCUMENT=${{ vars.WARP_READINESS_DOCUMENT || 'snorose-dev-warp-ready' }} \
+            WARP_READINESS_DOCUMENT=${{ vars.WARP_READINESS_DOCUMENT || 'snorose-dev-warp-ready' }}, \
+            REDIS_READINESS_DOCUMENT=${{ vars.REDIS_READINESS_DOCUMENT || 'snorose-dev-redis-ready' }} \
           }"
 
     - name: Wait for Lambda configuration update to complete

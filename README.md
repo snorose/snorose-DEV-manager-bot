@@ -29,6 +29,31 @@ DEV 서버를 중지하는 명령어입니다.
 
 DEV 서버의 상태를 조회하는 명령어입니다.
 
+앱이 실행 중이면 로컬 Redis의 읽기·쓰기·TTL 준비 상태도 조회합니다. Redis 검사 실패나 조회 불가는
+ALB가 정상이어도 경고로 표시합니다. 앱이 꺼져 있을 때는 검사 때문에 서버를 켜지 않습니다.
+
+## 로컬 Redis 상태와 종료 안내
+
+인프라 [#31](https://github.com/snorose/snorose-infra/pull/31)의 SSM 문서·IAM을 먼저 적용한 뒤
+이 봇을 배포합니다. `REDIS_READINESS_DOCUMENT`의 기본값은 `snorose-dev-redis-ready`입니다.
+Redis를 설치한 AMI와 서버 [#943](https://github.com/snorose/Snorose-Server/pull/943)의 연결 전환은
+인프라의 `terraform/envs/dev/LOCAL_REDIS.md` 순서를 따릅니다.
+
+`status_dev`는 현재 ASG에 앱 인스턴스가 한 대일 때 고정 문서를 한 번 실행하고 최대 6번 결과를 조회합니다.
+조회 사이 대기는 총 10초이며 AWS API 응답 시간은 별도입니다. 기존 Discord 비동기 응답을 사용합니다.
+서비스가 active이고 기존 임시 키 읽기·쓰기·TTL 검사가 성공해야 정상입니다. Redis의 키나 명령 출력은
+Discord로 전달하지 않으며, 검사 때문에 서비스를 시작·재시작하거나 배포를 실행하지 않습니다.
+
+- 이전 AMI에 로컬 Redis 표지가 없으면 `미설정`으로 표시합니다. ElastiCache의 정상 여부를 추정하지 않습니다.
+- IAM·문서·SSM 연결 오류와 시간 초과는 `확인 불가`로 처리합니다. 서버 교체 중 결과도 정상으로 재사용하지 않습니다.
+- 이 검사는 EC2의 로컬 Redis 준비 상태이며 앱의 실제 연결 대상이나 로그인 성공을 증명하지 않습니다.
+  로그인·갱신·로그아웃은 서버 CD의 smoke로 검증합니다.
+
+마지막 팀이 사용을 종료하고 ASG를 0으로 변경하는 데 성공하면, 로컬 Redis 사용 시
+로그인 유지·이메일 인증 상태가 초기화되므로 다시 로그인·인증해야 한다고 안내합니다.
+다른 팀이 남아 있거나 배포 보호로 종료가 보류되면 이 안내를 보내지 않습니다.
+같은 EC2의 앱 재배포는 Redis를 종료하지 않습니다.
+
 ## 로컬 테스트 방법
 
 1. ```pip install -r src/requirements.txt```와 ```pip install -r commands/requirements.txt```를 실행해 라이브러리를 설치합니다.
@@ -50,7 +75,7 @@ DEV 서버의 상태를 조회하는 명령어입니다.
 1. AWS에 Lambda 함수, ECR Repository, GitHub OIDC용 IAM Role을 미리 준비합니다.
 2. GitHub Environment는 `DEV`만 사용합니다. 배포 워크플로의 환경도 `DEV`로 고정합니다.
 3. 각 Environment variable에 ```AWS_ROLE_ARN```, ```AWS_REGION```, ```ECR_REPOSITORY_NAME```, ```LAMBDA_FUNCTION_NAME```, ```DISCORD_PUBLIC_KEY```, ```DISCORD_APPLICATION_ID```를 설정합니다.
-   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```, ```RDS_INSTANCE_IDENTIFIER```, ```PENDING_RECONCILE_RULE```는 GitHub 변수에서 생략하면 배포 워크플로의 DEV 기본값이 쓰입니다.
+   ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```, ```RDS_INSTANCE_IDENTIFIER```, ```REDIS_READINESS_DOCUMENT```, ```PENDING_RECONCILE_RULE```는 GitHub 변수에서 생략하면 배포 워크플로의 DEV 기본값이 쓰입니다.
    Lambda 환경변수는 워크플로가 맵 전체를 덮어쓰므로, 콘솔에서 직접 추가하면 다음 배포 때 사라집니다.
 4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다.
 5. `develop` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
@@ -123,7 +148,7 @@ Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`�
 | `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus` | 인스턴스 상태 검사 |
 | `elasticloadbalancing:DescribeTargetHealth` | `status_dev`의 앱 헬스체크 |
 | `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` | 활성 팀 상태 파일, 기동 잠금 및 배포 보호 기록 조회 |
-| `ssm:SendCommand`, `ssm:GetCommandInvocation` | 전용 NAT/WARP 문서를 실행하고 결과 확인 |
+| `ssm:SendCommand`, `ssm:GetCommandInvocation` | 전용 NAT/WARP/로컬 Redis 문서를 실행하고 결과 확인 |
 | `lambda:InvokeFunction` | NAT 및 앱의 순차 시작·중지 작업을 비동기로 실행 |
 | `events:EnableRule`, `events:DisableRule` | 작업 중 확인 규칙 한 개의 활성화·비활성화 |
 | `rds:DescribeDBInstances`, `rds:StartDBInstance`, `rds:StopDBInstance` | dev RDS `snorose-dev` 한 개의 준비 확인·시작·정지 |

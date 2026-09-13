@@ -21,6 +21,7 @@ FCK_NAT_NAME = os.environ.get("FCK_NAT_NAME", "snorose-dev-an2-fck-nat")
 WARP_NAME = os.environ.get("WARP_NAME", "WARPConnector-dev")
 NAT_READINESS_DOCUMENT = os.environ.get("NAT_READINESS_DOCUMENT", "snorose-dev-fck-nat-ready")
 WARP_READINESS_DOCUMENT = os.environ.get("WARP_READINESS_DOCUMENT", "snorose-dev-warp-ready")
+REDIS_READINESS_DOCUMENT = os.environ.get("REDIS_READINESS_DOCUMENT", "snorose-dev-redis-ready")
 RDS_INSTANCE_IDENTIFIER = os.environ.get("RDS_INSTANCE_IDENTIFIER", "snorose-dev")
 PENDING_RECONCILE_RULE = os.environ.get("PENDING_RECONCILE_RULE")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
@@ -46,6 +47,7 @@ NETWORK_READY_MAX_ATTEMPTS = 48
 NETWORK_READY_TIMEOUT_SECONDS = 240
 WARP_STOP_MAX_ATTEMPTS = 36
 APP_STOP_MAX_ATTEMPTS = 30
+REDIS_STATUS_MAX_ATTEMPTS = 6
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
@@ -899,6 +901,50 @@ def check_app_health():
     return f"❌ 애플리케이션 응답 이상 ({detail})"
 
 
+def check_redis_health():
+    """Run the fixed local probe through SSM; never return raw command output."""
+    unknown = "⚠️ Redis: 확인하지 못했습니다. SSM 연결과 진단 문서 권한을 확인해주세요."
+    try:
+        instances = get_asg().get("Instances", [])
+        if len(instances) != 1 or instances[0].get("LifecycleState", "").startswith("Terminating"):
+            return "⚠️ Redis: 검사할 앱 인스턴스를 하나로 확인할 수 없습니다. (기동·교체 중)"
+        instance_id = instances[0]["InstanceId"]
+        client = get_ssm_client()
+        command_id = client.send_command(
+            InstanceIds=[instance_id], DocumentName=REDIS_READINESS_DOCUMENT,
+            DocumentVersion="$DEFAULT", TimeoutSeconds=30,
+        )["Command"]["CommandId"]
+        for attempt in range(REDIS_STATUS_MAX_ATTEMPTS):
+            try:
+                result = client.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+            except Exception as error:
+                code = getattr(error, "response", {}).get("Error", {}).get("Code")
+                if code != "InvocationDoesNotExist":
+                    raise
+            else:
+                status = result.get("Status")
+                if status == "Success" and result.get("ResponseCode") == 0:
+                    current = get_asg().get("Instances", [])
+                    if (len(current) != 1 or current[0]["InstanceId"] != instance_id
+                            or current[0].get("LifecycleState", "").startswith("Terminating")):
+                        return "⚠️ Redis: 검사 중 앱 인스턴스가 교체·종료되었습니다. 다시 확인해주세요."
+                    output = result.get("StandardOutputContent", "").strip()
+                    if output == "LOCAL_REDIS_READY":
+                        return "✅ Redis: 로컬 읽기·쓰기·TTL 검사 통과"
+                    if output == "LOCAL_REDIS_NOT_CONFIGURED":
+                        return "⚠️ Redis: 로컬 Redis 미설정. 기존 Redis 상태는 별도로 확인해야 합니다."
+                    return unknown
+                if status == "Failed":
+                    return "❌ Redis: 로컬 준비 검사 실패. 로그인·토큰 갱신·이메일 인증을 확인해주세요."
+                if status not in {"Pending", "InProgress", "Delayed"}:
+                    return unknown
+            if attempt < REDIS_STATUS_MAX_ATTEMPTS - 1:
+                time.sleep(2)
+    except Exception:
+        return unknown
+    return "⚠️ Redis: 검사 결과 대기 시간이 초과되었습니다. 잠시 후 다시 확인해주세요."
+
+
 def handle_status_dev():
     instance_state = get_instance_state()
     instance_status = get_instance_status()
@@ -915,11 +961,13 @@ def handle_status_dev():
 
     if instance_state == "running":
         app_health = check_app_health()
+        redis_health = check_redis_health()
         is_initializing = "진행 중" in instance_status
         is_app_starting = bool(app_health) and "⏳" in app_health
         has_app_error = bool(app_health) and "❌" in app_health
 
-        if has_app_error or nat_state != "running" or warp_state != "running" or rds_state != "available":
+        if (has_app_error or not redis_health.startswith("✅") or nat_state != "running"
+                or warp_state != "running" or rds_state != "available"):
             prefix = "⚠️"
         elif is_initializing or is_app_starting:
             prefix = "⏳"
@@ -929,6 +977,7 @@ def handle_status_dev():
         msg = f"{prefix} DEV 서버가 실행 중입니다.\n{instance_status}"
         if app_health:
             msg += f"\n{app_health}"
+        msg += f"\n{redis_health}"
         msg += f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}\nRDS: {rds_state}"
         msg += f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
         return msg
@@ -1003,7 +1052,11 @@ def stop_instance():
     except Exception as e:
         return f"서버 중지 실패: {str(e)}"
 
-    return "🛑 서버를 중지 중입니다..."
+    return (
+        "🛑 서버를 중지 중입니다..."
+        "\nℹ️ 로컬 Redis 사용 시 앱 EC2 종료와 함께 로그인 유지·이메일 인증 상태가 초기화됩니다."
+        " 다음 사용 시 다시 로그인하고 이메일 인증을 새로 진행해주세요."
+    )
 
 
 def send_discord_response(method, path, payload, timeout):
