@@ -40,6 +40,9 @@ class FakeS3Client:
         )
         self.body = Body
 
+    def list_objects_v2(self, **kwargs):
+        return {"Contents": []}
+
     @property
     def active_teams(self):
         return json.loads(self.body)["active_teams"]
@@ -108,7 +111,9 @@ class ActiveTeamsStateTest(unittest.TestCase):
         main.get_instance_status = lambda: "✅ 상태 검사 통과!"
         main.get_fck_nat_state = lambda: "running"
         main.get_warp_state = lambda: "running"
+        main.get_rds_state = lambda: "available"
         main.check_app_health = lambda: "✅ 애플리케이션 응답 정상"
+        main.check_redis_health = lambda: "✅ Redis: 로컬 읽기·쓰기·TTL 검사 통과"
 
         message = main.handle_status_dev()
 

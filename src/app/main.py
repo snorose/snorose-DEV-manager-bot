@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import uuid
 import urllib.request
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -20,11 +21,17 @@ FCK_NAT_NAME = os.environ.get("FCK_NAT_NAME", "snorose-dev-an2-fck-nat")
 WARP_NAME = os.environ.get("WARP_NAME", "WARPConnector-dev")
 NAT_READINESS_DOCUMENT = os.environ.get("NAT_READINESS_DOCUMENT", "snorose-dev-fck-nat-ready")
 WARP_READINESS_DOCUMENT = os.environ.get("WARP_READINESS_DOCUMENT", "snorose-dev-warp-ready")
+REDIS_READINESS_DOCUMENT = os.environ.get("REDIS_READINESS_DOCUMENT", "snorose-dev-redis-ready")
+RDS_INSTANCE_IDENTIFIER = os.environ.get("RDS_INSTANCE_IDENTIFIER", "snorose-dev")
+PENDING_RECONCILE_RULE = os.environ.get("PENDING_RECONCILE_RULE")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
 ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-dev-bucket")
 ACTIVE_TEAMS_KEY = os.environ.get("ACTIVE_TEAMS_KEY", "dev-manager/active-teams.json")
+DEPLOYMENTS_PREFIX = "dev-manager/deployments/"
+STARTUP_LOCK_KEY = "dev-manager/startup-lock.json"
+STARTUP_LOCK_SECONDS = 660  # Longer than the Lambda's 600-second timeout.
 
 # 인스턴스가 살아있다고 볼 EC2 상태. terminated/shutting-down은 제외해야 한다 —
 # 태그 조회는 종료된 지 얼마 안 된 인스턴스까지 함께 돌려주기 때문이다.
@@ -34,11 +41,13 @@ FCK_NAT_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
 INTERNAL_EVENT_SOURCE = "snorose.dev-manager-bot"
 START_APP_AFTER_NAT_ACTION = "start_app_after_nat"
 STOP_NAT_AFTER_APP_ACTION = "stop_nat_after_app"
+RECONCILE_RDS_ACTION = "reconcile_rds"
 WAIT_INTERVAL_SECONDS = 5
 NETWORK_READY_MAX_ATTEMPTS = 48
 NETWORK_READY_TIMEOUT_SECONDS = 240
 WARP_STOP_MAX_ATTEMPTS = 36
 APP_STOP_MAX_ATTEMPTS = 30
+REDIS_STATUS_MAX_ATTEMPTS = 6
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
@@ -60,6 +69,8 @@ asg_client = None
 elbv2_client = None
 lambda_client = None
 ssm_client = None
+rds_client = None
+events_client = None
 
 
 class ActiveTeamsStateError(Exception):
@@ -142,6 +153,71 @@ def get_ssm_client():
     return ssm_client
 
 
+def get_rds_client():
+    global rds_client
+
+    if rds_client is None:
+        import boto3
+        from botocore.config import Config
+
+        rds_client = boto3.client(
+            "rds", region_name=AWS_REGION,
+            config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 2}),
+        )
+    return rds_client
+
+
+def get_events_client():
+    global events_client
+
+    if events_client is None:
+        import boto3
+        from botocore.config import Config
+
+        events_client = boto3.client(
+            "events", region_name=AWS_REGION,
+            config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 2}),
+        )
+    return events_client
+
+
+def set_pending_reconcile(enabled):
+    # An unset rule keeps compatibility until the Terraform/IAM rollout is ready.
+    if PENDING_RECONCILE_RULE:
+        operation = "enable_rule" if enabled else "disable_rule"
+        getattr(get_events_client(), operation)(Name=PENDING_RECONCILE_RULE)
+
+
+def needs_fast_reconcile():
+    teams = load_active_teams(require_existing=True)
+    asg = get_asg()
+    if has_active_deployment():
+        return True
+    rds_state = get_rds_state()
+    if teams or asg["DesiredCapacity"] > 0:
+        return rds_state != "available" or asg["DesiredCapacity"] == 0
+    return (bool(asg.get("Instances")) or rds_state != "stopped"
+            or get_warp_state() != "stopped" or get_fck_nat_state() != "stopped")
+
+
+def sync_reconcile_schedule():
+    if not PENDING_RECONCILE_RULE:
+        return
+    if needs_fast_reconcile():
+        set_pending_reconcile(True)
+        return
+    set_pending_reconcile(False)
+    # Start/stop records its intent before enabling the rule. Re-read after disable
+    # so an older reconciliation cannot leave a concurrent request without fast checks.
+    try:
+        pending = needs_fast_reconcile()
+    except Exception:
+        set_pending_reconcile(True)
+        raise
+    if pending:
+        set_pending_reconcile(True)
+
+
 def normalize_active_teams(teams):
     normalized = []
     for team in teams:
@@ -158,7 +234,7 @@ def is_missing_s3_object_error(error):
     )
 
 
-def load_active_teams():
+def load_active_teams(require_existing=False):
     try:
         response = get_s3_client().get_object(
             Bucket=ACTIVE_TEAMS_BUCKET,
@@ -166,11 +242,19 @@ def load_active_teams():
         )
         body = response["Body"].read().decode("utf-8")
         if not body.strip():
+            if require_existing:
+                raise ValueError("활성 팀 상태 파일이 비어 있습니다.")
             return []
         payload = json.loads(body)
+        if require_existing and (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("active_teams"), list)
+            or any(not isinstance(team, str) or not team for team in payload["active_teams"])
+        ):
+            raise ValueError("활성 팀 상태 파일 형식이 올바르지 않습니다.")
         return normalize_active_teams(payload.get("active_teams", []))
     except Exception as e:
-        if is_missing_s3_object_error(e):
+        if is_missing_s3_object_error(e) and not require_existing:
             return []
         raise ActiveTeamsStateError(f"활성 팀 상태 조회 오류: {e}") from e
 
@@ -190,6 +274,77 @@ def save_active_teams(teams):
 
 def format_active_teams(teams):
     return ", ".join(teams) if teams else "없음"
+
+
+def has_active_deployment():
+    # Each CD attempt owns one object; overlapping runs cannot release each other.
+    # Lookup/parse errors propagate so an unknown deployment state never allows stop.
+    continuation = {}
+    while True:
+        page = get_s3_client().list_objects_v2(
+            Bucket=ACTIVE_TEAMS_BUCKET, Prefix=DEPLOYMENTS_PREFIX, **continuation,
+        )
+        for item in page.get("Contents", []):
+            try:
+                response = get_s3_client().get_object(Bucket=ACTIVE_TEAMS_BUCKET, Key=item["Key"])
+            except Exception as error:
+                if getattr(error, "response", {}).get("Error", {}).get("Code") == "NoSuchKey":
+                    continue  # The corresponding CD attempt just finished.
+                raise
+            lease = json.loads(response["Body"].read())
+            expires_at = lease["expires_at"]
+            if type(expires_at) is not int:
+                raise ValueError("배포 보호 기록의 만료 시각이 올바르지 않습니다.")
+            if expires_at > datetime.now(timezone.utc).timestamp():
+                return True
+        if not page.get("IsTruncated"):
+            return False
+        continuation = {"ContinuationToken": page["NextContinuationToken"]}
+
+
+def acquire_startup_lock():
+    now = int(datetime.now(timezone.utc).timestamp())
+    request = {
+        "Bucket": ACTIVE_TEAMS_BUCKET, "Key": STARTUP_LOCK_KEY,
+        "Body": json.dumps({"owner": str(uuid.uuid4()), "expires_at": now + STARTUP_LOCK_SECONDS}),
+        "ContentType": "application/json",
+    }
+    try:
+        # Create first: GetObject on a missing key can return AccessDenied when
+        # ListBucket is restricted. Conditional creation needs no bucket listing.
+        return get_s3_client().put_object(**request, IfNoneMatch="*")["ETag"]
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        if code == "ConditionalRequestConflict":
+            return None
+        if code != "PreconditionFailed":
+            raise
+
+    try:
+        response = get_s3_client().get_object(Bucket=ACTIVE_TEAMS_BUCKET, Key=STARTUP_LOCK_KEY)
+        lock = json.loads(response["Body"].read())
+        if type(lock["expires_at"]) is not int:
+            raise ValueError("시작 작업 잠금의 만료 시각이 올바르지 않습니다.")
+        if lock["expires_at"] > now:
+            return None
+        return get_s3_client().put_object(**request, IfMatch=response["ETag"])["ETag"]
+    except Exception as error:
+        if getattr(error, "response", {}).get("Error", {}).get("Code") in {
+            "PreconditionFailed", "ConditionalRequestConflict", "NoSuchKey",
+        }:
+            return None  # Another invocation acquired or changed the lock first.
+        raise
+
+
+def release_startup_lock(etag):
+    try:
+        get_s3_client().put_object(
+            Bucket=ACTIVE_TEAMS_BUCKET, Key=STARTUP_LOCK_KEY,
+            Body=json.dumps({"expires_at": 0}), ContentType="application/json", IfMatch=etag,
+        )
+    except Exception as error:
+        # Never overwrite a newer owner's lock. A failed release expires naturally.
+        print(f"시작 작업 잠금 해제 실패: {error}")
 
 
 def get_asg():
@@ -318,27 +473,122 @@ def invoke_background_action(action):
         raise RuntimeError(f"비동기 작업 호출 실패: status={response.get('StatusCode')}")
 
 
+def get_rds_state():
+    if not RDS_INSTANCE_IDENTIFIER:
+        raise ValueError("RDS_INSTANCE_IDENTIFIER가 비어 있습니다.")
+    instances = get_rds_client().describe_db_instances(
+        DBInstanceIdentifier=RDS_INSTANCE_IDENTIFIER,
+    )["DBInstances"]
+    if len(instances) != 1:
+        raise RuntimeError("DEV RDS 인스턴스를 하나로 확인할 수 없습니다.")
+    return instances[0]["DBInstanceStatus"]
+
+
+def change_rds_state(operation):
+    try:
+        response = getattr(get_rds_client(), operation)(
+            DBInstanceIdentifier=RDS_INSTANCE_IDENTIFIER,
+        )
+        return response["DBInstance"]["DBInstanceStatus"]
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        # Concurrent commands or an RDS transition can invalidate a preceding read.
+        if code == "InvalidDBInstanceState":
+            return get_rds_state()
+        raise
+
+
+def start_rds():
+    state = get_rds_state()
+    if state == "stopped":
+        return change_rds_state("start_db_instance")
+    # In particular, wait for stopping to finish before attempting another start.
+    return state
+
+
+def dev_is_idle():
+    # Missing/unreadable state is not evidence that nobody is using the database.
+    if load_active_teams(require_existing=True) or has_active_deployment():
+        return False
+    asg = get_asg()
+    return asg["DesiredCapacity"] == 0 and not asg.get("Instances", [])
+
+
+def stop_rds_if_idle():
+    if not dev_is_idle():
+        return {"status": "cancelled", "reason": "활성 팀 또는 앱 인스턴스 존재"}
+    state = get_rds_state()
+    if state == "available" and dev_is_idle():
+        state = change_rds_state("stop_db_instance")
+    return {"status": "completed" if state == "stopped" else "waiting", "rds": state}
+
+
+def reconcile_rds():
+    teams = load_active_teams(require_existing=True)
+    asg = get_asg()
+    if teams or asg["DesiredCapacity"] > 0 or has_active_deployment():
+        state = start_rds()
+        # A scheduled invocation resumes startup without waiting through RDS recovery
+        # inside a single Lambda invocation. Keep manually started application ASGs up.
+        if state == "available" and teams and asg["DesiredCapacity"] == 0:
+            invoke_background_action(START_APP_AFTER_NAT_ACTION)
+            return {"status": "scheduled", "rds": state}
+        return {"status": "completed" if state == "available" else "waiting", "rds": state}
+    # Includes the automatic RDS restart after seven stopped days. Never stop a DB
+    # while any app instance remains, including a target still draining from the ALB.
+    result = stop_rds_if_idle()
+    if dev_is_idle():
+        result["network"] = reconcile_idle_network()
+    return result
+
+
+def reconcile_idle_network():
+    # A failed build can leave NAT running before an app was ever launched.
+    # Do not wait inside the periodic invocation; revisit stopping states next minute.
+    if not dev_is_idle():
+        return "cancelled"
+    warp = get_network_instance(WARP_NAME)
+    state = warp["State"]["Name"]
+    if state == "running" and dev_is_idle():
+        get_ec2_client().stop_instances(InstanceIds=[warp["InstanceId"]])
+        return "WARP stopping"
+    if state == "stopped" and dev_is_idle():
+        return stop_fck_nat_instance()
+    return "WARP waiting"
+
+
 def start_dev_stack():
     try:
+        # handle_start_dev has already persisted the team's intent to start.
+        set_pending_reconcile(True)
+        rds_state = start_rds()
         nat_message = start_fck_nat_instance()
         invoke_background_action(START_APP_AFTER_NAT_ACTION)
     except Exception as e:
         return f"❌ DEV 서버 시작 예약 실패: {e}"
 
-    return f"{nat_message}\n🚀 NAT 준비가 끝나면 WARP를 확인하고 앱 서버를 자동으로 시작합니다."
+    return (
+        f"{nat_message}\nRDS: {rds_state}"
+        "\n🚀 RDS와 네트워크 준비가 끝나면 앱 서버를 자동으로 시작합니다."
+        " RDS 시작에는 수분 이상 걸릴 수 있습니다. `/status_dev`로 확인해주세요."
+    )
 
 
 def stop_dev_stack():
+    if has_active_deployment():
+        return "⏳ 자동 배포 중이므로 서버를 유지합니다. 배포 완료 후 `/stop_dev`를 다시 실행해주세요."
     app_message = stop_instance()
     if "실패" in app_message or app_message.startswith("❌"):
         return app_message
 
     try:
+        # Enable only after desired=0 is visible to concurrent reconcilers.
+        set_pending_reconcile(True)
         invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
     except Exception as e:
-        return f"{app_message}\n❌ fck-nat 중지 예약 실패: {e}"
+        return f"{app_message}\n❌ DEV 후속 정리 예약 실패: {e}"
 
-    return f"{app_message}\n🛑 앱 서버가 종료되면 WARP와 fck-nat를 순서대로 중지합니다."
+    return f"{app_message}\n🛑 앱 서버가 종료되면 WARP·fck-nat와 RDS를 중지합니다."
 
 
 def wait_for_network_ready(name, document_name):
@@ -392,7 +642,7 @@ def wait_for_fck_nat_ready():
 
 def wait_for_warp_stopped():
     for attempt in range(WARP_STOP_MAX_ATTEMPTS):
-        if load_active_teams() or get_asg()["DesiredCapacity"] > 0:
+        if load_active_teams() or has_active_deployment() or get_asg()["DesiredCapacity"] > 0:
             return False
         instance = get_network_instance(WARP_NAME)
         state = instance["State"]["Name"]
@@ -409,7 +659,7 @@ def stop_network_after_app():
     if not wait_for_app_stopped() or not wait_for_warp_stopped():
         return {"status": "cancelled", "reason": "새 시작 요청 존재"}
     # WARP 정지 대기 중 들어온 start_dev 요청도 다시 확인한다.
-    if load_active_teams() or get_asg()["DesiredCapacity"] > 0:
+    if load_active_teams() or has_active_deployment() or get_asg()["DesiredCapacity"] > 0:
         return {"status": "cancelled", "reason": "새 시작 요청 존재"}
     return {"status": "completed", "nat": stop_fck_nat_instance()}
 
@@ -419,7 +669,7 @@ def wait_for_app_stopped():
         asg = get_asg()
 
         # 새 start_dev 요청이 들어오면 이전 stop 작업이 NAT를 내리지 않도록 취소한다.
-        if asg["DesiredCapacity"] > 0:
+        if asg["DesiredCapacity"] > 0 or has_active_deployment():
             return False
         if not asg.get("Instances", []):
             return True
@@ -430,29 +680,58 @@ def wait_for_app_stopped():
     raise TimeoutError("앱 서버가 제한 시간 안에 ASG에서 제거되지 않았습니다.")
 
 
+def start_app_after_network():
+    action = START_APP_AFTER_NAT_ACTION
+    try:
+        if not load_active_teams():
+            raise StartCancelled()
+        rds_state = start_rds()
+        if rds_state not in {"available", "starting", "stopping"}:
+            return {"action": action, "status": "waiting", "rds": rds_state}
+        # RDS recovery runs while NAT/WARP become ready. The ASG's CodeDeploy
+        # launch hook starts the app, so capacity still waits for both checks.
+        nat_instance_id = wait_for_fck_nat_ready()
+        warp_instance_id = wait_for_network_ready(WARP_NAME, WARP_READINESS_DOCUMENT)
+        # An old stop may have reached RDS while network readiness was pending.
+        rds_state = get_rds_state()
+        if rds_state != "available":
+            return {"action": action, "status": "waiting", "rds": rds_state}
+        if not load_active_teams():
+            raise StartCancelled()
+    except StartCancelled:
+        # 취소된 시작 작업도 앱/WARP가 종료되기 전에 NAT를 정지하면 안 된다.
+        # 시작 대기로 timeout을 소진했을 수 있어 종료 대기는 별도 호출에서 수행한다.
+        invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
+        return {"action": action, "status": "cancelled", "reason": "종료 작업 예약"}
+    app_message = start_instance()
+    if "실패" in app_message or app_message.startswith("❌"):
+        raise RuntimeError(app_message)
+    return {
+        "action": action, "status": "completed",
+        "nat_instance_id": nat_instance_id, "warp_instance_id": warp_instance_id,
+        "app": app_message,
+    }
+
+
 def handle_internal_event(event):
     action = event.get("action")
+    if action == RECONCILE_RDS_ACTION:
+        result = reconcile_rds()
+        sync_reconcile_schedule()
+        return {"action": action, **result}
     if action == START_APP_AFTER_NAT_ACTION:
+        etag = acquire_startup_lock()
+        if etag is None:
+            return {"action": action, "status": "busy"}
         try:
-            nat_instance_id = wait_for_fck_nat_ready()
-            warp_instance_id = wait_for_network_ready(WARP_NAME, WARP_READINESS_DOCUMENT)
-            if not load_active_teams():
-                raise StartCancelled()
-        except StartCancelled:
-            # 취소된 시작 작업도 앱/WARP가 종료되기 전에 NAT를 정지하면 안 된다.
-            # 시작 대기로 timeout을 소진했을 수 있어 종료 대기는 별도 호출에서 수행한다.
-            invoke_background_action(STOP_NAT_AFTER_APP_ACTION)
-            return {"action": action, "status": "cancelled", "reason": "종료 작업 예약"}
-        app_message = start_instance()
-        if "실패" in app_message or app_message.startswith("❌"):
-            raise RuntimeError(app_message)
-        return {
-            "action": action, "status": "completed",
-            "nat_instance_id": nat_instance_id, "warp_instance_id": warp_instance_id,
-            "app": app_message,
-        }
+            return start_app_after_network()
+        finally:
+            release_startup_lock(etag)
     if action == STOP_NAT_AFTER_APP_ACTION:
-        return {"action": action, **stop_network_after_app()}
+        result = stop_network_after_app()
+        if result["status"] == "completed":
+            result["database"] = stop_rds_if_idle()
+        return {"action": action, **result}
     raise ValueError(f"지원하지 않는 내부 작업입니다: {action}")
 
 
@@ -563,8 +842,11 @@ def handle_stop_dev(user_roles):
         return f"❌ {str(e)}"
 
     removed_roles = [role for role in user_roles if role in active_teams]
+    remaining_teams = [role for role in active_teams if role not in removed_roles]
+    if not remaining_teams and has_active_deployment():
+        return "⏳ 자동 배포 중이므로 종료하지 않았습니다. 배포 완료 후 `/stop_dev`를 다시 실행해주세요."
     if removed_roles:
-        active_teams = [role for role in active_teams if role not in removed_roles]
+        active_teams = remaining_teams
         try:
             save_active_teams(active_teams)
         except Exception as e:
@@ -619,11 +901,59 @@ def check_app_health():
     return f"❌ 애플리케이션 응답 이상 ({detail})"
 
 
+def check_redis_health():
+    """Run the fixed local probe through SSM; never return raw command output."""
+    unknown = "⚠️ Redis: 확인하지 못했습니다. SSM 연결과 진단 문서 권한을 확인해주세요."
+    try:
+        instances = get_asg().get("Instances", [])
+        if len(instances) != 1 or instances[0].get("LifecycleState", "").startswith("Terminating"):
+            return "⚠️ Redis: 검사할 앱 인스턴스를 하나로 확인할 수 없습니다. (기동·교체 중)"
+        instance_id = instances[0]["InstanceId"]
+        client = get_ssm_client()
+        command_id = client.send_command(
+            InstanceIds=[instance_id], DocumentName=REDIS_READINESS_DOCUMENT,
+            DocumentVersion="$DEFAULT", TimeoutSeconds=30,
+        )["Command"]["CommandId"]
+        for attempt in range(REDIS_STATUS_MAX_ATTEMPTS):
+            try:
+                result = client.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+            except Exception as error:
+                code = getattr(error, "response", {}).get("Error", {}).get("Code")
+                if code != "InvocationDoesNotExist":
+                    raise
+            else:
+                status = result.get("Status")
+                if status == "Success" and result.get("ResponseCode") == 0:
+                    current = get_asg().get("Instances", [])
+                    if (len(current) != 1 or current[0]["InstanceId"] != instance_id
+                            or current[0].get("LifecycleState", "").startswith("Terminating")):
+                        return "⚠️ Redis: 검사 중 앱 인스턴스가 교체·종료되었습니다. 다시 확인해주세요."
+                    output = result.get("StandardOutputContent", "").strip()
+                    if output == "LOCAL_REDIS_READY":
+                        return "✅ Redis: 로컬 읽기·쓰기·TTL 검사 통과"
+                    if output == "LOCAL_REDIS_NOT_CONFIGURED":
+                        return "⚠️ Redis: 로컬 Redis 미설정. 기존 Redis 상태는 별도로 확인해야 합니다."
+                    return unknown
+                if status == "Failed":
+                    return "❌ Redis: 로컬 준비 검사 실패. 로그인·토큰 갱신·이메일 인증을 확인해주세요."
+                if status not in {"Pending", "InProgress", "Delayed"}:
+                    return unknown
+            if attempt < REDIS_STATUS_MAX_ATTEMPTS - 1:
+                time.sleep(2)
+    except Exception:
+        return unknown
+    return "⚠️ Redis: 검사 결과 대기 시간이 초과되었습니다. 잠시 후 다시 확인해주세요."
+
+
 def handle_status_dev():
     instance_state = get_instance_state()
     instance_status = get_instance_status()
     nat_state = get_fck_nat_state()
     warp_state = get_warp_state()
+    try:
+        rds_state = get_rds_state()
+    except Exception:
+        rds_state = "조회 실패"
     try:
         active_teams = load_active_teams()
     except ActiveTeamsStateError as e:
@@ -631,11 +961,13 @@ def handle_status_dev():
 
     if instance_state == "running":
         app_health = check_app_health()
+        redis_health = check_redis_health()
         is_initializing = "진행 중" in instance_status
         is_app_starting = bool(app_health) and "⏳" in app_health
         has_app_error = bool(app_health) and "❌" in app_health
 
-        if has_app_error or nat_state != "running" or warp_state != "running":
+        if (has_app_error or not redis_health.startswith("✅") or nat_state != "running"
+                or warp_state != "running" or rds_state != "available"):
             prefix = "⚠️"
         elif is_initializing or is_app_starting:
             prefix = "⏳"
@@ -645,20 +977,21 @@ def handle_status_dev():
         msg = f"{prefix} DEV 서버가 실행 중입니다.\n{instance_status}"
         if app_health:
             msg += f"\n{app_health}"
-        msg += f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
+        msg += f"\n{redis_health}"
+        msg += f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}\nRDS: {rds_state}"
         msg += f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
         return msg
 
-    if instance_state == "stopped" and (nat_state in {"pending", "running", "stopping"} or warp_state in {"pending", "running", "stopping"}):
-        if active_teams:
+    if instance_state == "stopped" and (active_teams or rds_state != "stopped" or nat_state in {"pending", "running", "stopping"} or warp_state in {"pending", "running", "stopping"}):
+        if active_teams or has_active_deployment():
             return (
-                "⏳ DEV 서버가 시작 중입니다. (NAT와 WARP 준비 확인 후 앱 서버 시작)"
-                f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
+                "⏳ DEV 서버가 시작 중입니다. (RDS와 네트워크 준비 확인 후 앱 서버 시작)"
+                f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}\nRDS: {rds_state}"
                 f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
             )
         return (
             "⏳ DEV 서버가 중지 중입니다."
-            f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
+            f"\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}\nRDS: {rds_state}"
             f"\n테스트 중인 팀: {format_active_teams(active_teams)}"
         )
 
@@ -669,7 +1002,7 @@ def handle_status_dev():
     }
 
     message = status_messages.get(instance_state, f"⚠️ 서버 상태: {instance_state}")
-    return f"{message}\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}"
+    return f"{message}\n{format_fck_nat_state(nat_state)}\nWARP: {warp_state}\nRDS: {rds_state}"
 
 
 def start_instance():
@@ -719,7 +1052,11 @@ def stop_instance():
     except Exception as e:
         return f"서버 중지 실패: {str(e)}"
 
-    return "🛑 서버를 중지 중입니다..."
+    return (
+        "🛑 서버를 중지 중입니다..."
+        "\nℹ️ 로컬 Redis 사용 시 앱 EC2 종료와 함께 로그인 유지·이메일 인증 상태가 초기화됩니다."
+        " 다음 사용 시 다시 로그인하고 이메일 인증을 새로 진행해주세요."
+    )
 
 
 def send_discord_response(method, path, payload, timeout):

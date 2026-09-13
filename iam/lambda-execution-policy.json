@@ -97,10 +97,67 @@
       }
     },
     {
+      "Sid": "UseDevRedisReadinessDocument",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:ap-northeast-2:621962613485:document/snorose-dev-redis-ready"
+    },
+    {
+      "Sid": "CheckDevAppRedis",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:ap-northeast-2:621962613485:instance/*",
+      "Condition": {
+        "StringEquals": { "ssm:resourceTag/Name": "snorose-dev" }
+      }
+    },
+    {
       "Sid": "ReadDevReadinessResult",
       "Effect": "Allow",
       "Action": "ssm:GetCommandInvocation",
       "Resource": "*"
+    },
+    {
+      "Sid": "ControlDevRdsInstance",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBInstances",
+        "rds:StartDBInstance",
+        "rds:StopDBInstance"
+      ],
+      "Resource": "arn:aws:rds:ap-northeast-2:621962613485:db:snorose-dev"
+    },
+    {
+      "Sid": "ReadDevDeploymentLeases",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::snorose-dev-bucket/dev-manager/deployments/*"
+    },
+    {
+      "Sid": "ListDevDeploymentLeases",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::snorose-dev-bucket",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "dev-manager/deployments/*"
+        }
+      }
+    },
+    {
+      "Sid": "TogglePendingDevReconcile",
+      "Effect": "Allow",
+      "Action": ["events:EnableRule", "events:DisableRule"],
+      "Resource": "arn:aws:events:ap-northeast-2:621962613485:rule/snorose-dev-manager-bot-rds-pending"
+    },
+    {
+      "Sid": "ManageDevStartupLock",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::snorose-dev-bucket/dev-manager/startup-lock.json"
     }
   ]
 }

@@ -6,7 +6,10 @@ import pathlib
 import sys
 import unittest
 import time
+import hashlib
+import threading
 from types import SimpleNamespace
+from botocore.exceptions import ClientError
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -107,10 +110,55 @@ class FakeLambdaClient:
 class FakeS3Client:
     def __init__(self, teams):
         self.teams = teams
+        self.objects = {}
+        self.guard = threading.Lock()
 
     def get_object(self, Bucket, Key):
+        if Key == "dev-manager/startup-lock.json":
+            with self.guard:
+                if Key not in self.objects:
+                    raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+                body, etag = self.objects[Key]
+            return {"Body": io.BytesIO(body), "ETag": etag}
         body = json.dumps({"active_teams": self.teams}).encode()
         return {"Body": io.BytesIO(body)}
+
+    def list_objects_v2(self, **kwargs):
+        return {"Contents": []}
+
+    def put_object(self, **kwargs):
+        if kwargs["Key"] == "dev-manager/startup-lock.json":
+            with self.guard:
+                current = self.objects.get(kwargs["Key"])
+                if (kwargs.get("IfNoneMatch") == "*" and current is not None) or (
+                    "IfMatch" in kwargs and (current is None or current[1] != kwargs["IfMatch"])
+                ):
+                    raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+                body = kwargs["Body"].encode()
+                etag = hashlib.sha256(body).hexdigest()
+                self.objects[kwargs["Key"]] = (body, etag)
+                return {"ETag": etag}
+        self.teams = json.loads(kwargs["Body"])["active_teams"]
+
+
+class FakeRdsClient:
+    def __init__(self, state="available"):
+        self.state = state
+        self.start_calls = []
+        self.stop_calls = []
+
+    def describe_db_instances(self, DBInstanceIdentifier):
+        return {"DBInstances": [{"DBInstanceStatus": self.state}]}
+
+    def start_db_instance(self, DBInstanceIdentifier):
+        self.start_calls.append(DBInstanceIdentifier)
+        self.state = "starting"
+        return {"DBInstance": {"DBInstanceStatus": self.state}}
+
+    def stop_db_instance(self, DBInstanceIdentifier):
+        self.stop_calls.append(DBInstanceIdentifier)
+        self.state = "stopping"
+        return {"DBInstance": {"DBInstanceStatus": self.state}}
 
 
 class FakeSsmClient:
@@ -135,6 +183,7 @@ def import_main():
     main.s3_client = FakeS3Client(["인프라"])
     main.ec2_client = FakeEc2Client()
     main.asg_client = FakeAsgClient()
+    main.rds_client = FakeRdsClient()
     main.time = SimpleNamespace(sleep=lambda seconds: None, monotonic=time.monotonic)
     return main
 
@@ -252,7 +301,7 @@ class FckNatControlTest(unittest.TestCase):
             fake_lambda.invocations[0]["Payload"]["action"],
             main.START_APP_AFTER_NAT_ACTION,
         )
-        self.assertIn("NAT 준비가 끝나면", message)
+        self.assertIn("RDS와 네트워크 준비가 끝나면", message)
 
     def test_start_worker_waits_for_nat_then_starts_app_asg(self):
         main = import_main()
