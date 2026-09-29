@@ -27,6 +27,7 @@ PENDING_RECONCILE_RULE = os.environ.get("PENDING_RECONCILE_RULE")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-dev-bucket")
 ACTIVE_TEAMS_KEY = os.environ.get("ACTIVE_TEAMS_KEY", "dev-manager/active-teams.json")
 DEPLOYMENTS_PREFIX = "dev-manager/deployments/"
@@ -42,12 +43,15 @@ INTERNAL_EVENT_SOURCE = "snorose.dev-manager-bot"
 START_APP_AFTER_NAT_ACTION = "start_app_after_nat"
 STOP_NAT_AFTER_APP_ACTION = "stop_nat_after_app"
 RECONCILE_RDS_ACTION = "reconcile_rds"
+WAIT_FOR_APP_READY_ACTION = "wait_for_app_ready"
 WAIT_INTERVAL_SECONDS = 5
 NETWORK_READY_MAX_ATTEMPTS = 48
 NETWORK_READY_TIMEOUT_SECONDS = 240
 WARP_STOP_MAX_ATTEMPTS = 36
 APP_STOP_MAX_ATTEMPTS = 30
 REDIS_STATUS_MAX_ATTEMPTS = 6
+APP_READY_MAX_ATTEMPTS = 20
+APP_READY_TIMEOUT_SECONDS = 60 * 60
 
 app = Flask(__name__)
 asgi_app = WsgiToAsgi(app)
@@ -458,16 +462,17 @@ def format_fck_nat_state(state):
     return messages.get(state, f"⚠️ fck-nat 상태: {state}")
 
 
-def invoke_background_action(action):
+def invoke_background_action(action, notification=None):
     if not LAMBDA_FUNCTION_NAME:
         raise RuntimeError("AWS_LAMBDA_FUNCTION_NAME 환경변수를 찾을 수 없습니다.")
 
+    payload = {"source": INTERNAL_EVENT_SOURCE, "action": action}
+    if notification:
+        payload["notification"] = notification
     response = get_lambda_client().invoke(
         FunctionName=LAMBDA_FUNCTION_NAME,
         InvocationType="Event",
-        Payload=json.dumps(
-            {"source": INTERNAL_EVENT_SOURCE, "action": action}
-        ).encode("utf-8"),
+        Payload=json.dumps(payload).encode("utf-8"),
     )
     if response.get("StatusCode") != 202:
         raise RuntimeError(f"비동기 작업 호출 실패: status={response.get('StatusCode')}")
@@ -680,6 +685,76 @@ def wait_for_app_stopped():
     raise TimeoutError("앱 서버가 제한 시간 안에 ASG에서 제거되지 않았습니다.")
 
 
+def is_app_ready():
+    asg = get_asg()
+    if asg["DesiredCapacity"] < 1 or not asg.get("TargetGroupARNs"):
+        return False
+    instance_ids = {
+        instance["InstanceId"] for instance in asg.get("Instances", [])
+        if instance.get("LifecycleState") == "InService"
+    }
+    if not instance_ids:
+        return False
+    targets = get_elbv2_client().describe_target_health(
+        TargetGroupArn=asg["TargetGroupARNs"][0]
+    ).get("TargetHealthDescriptions", [])
+    return any(
+        target.get("Target", {}).get("Id") in instance_ids
+        and target.get("TargetHealth", {}).get("State") == "healthy"
+        for target in targets
+    )
+
+
+def send_ready_notification(notification, content):
+    if not DISCORD_BOT_TOKEN:
+        raise RuntimeError("DISCORD_BOT_TOKEN 환경변수를 찾을 수 없습니다.")
+    user_id = notification["user_id"]
+    payload = {
+        "content": f"<@{user_id}> {content}",
+        "allowed_mentions": {"parse": [], "users": [user_id]},
+        "nonce": notification["interaction_id"],
+        "enforce_nonce": True,
+    }
+    channel_id = quote(notification["channel_id"], safe="")
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{channel_id}/messages",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+            "Content-Type": "application/json",
+            "User-Agent": "SnoroseDevManagerBot/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except HTTPError as error:
+        raise RuntimeError(f"Discord 준비 알림 실패: HTTP {error.code}") from None
+    except (URLError, TimeoutError):
+        raise RuntimeError("Discord 준비 알림 실패: 연결 오류") from None
+
+
+def wait_for_app_ready(notification):
+    for attempt in range(APP_READY_MAX_ATTEMPTS):
+        active_teams = load_active_teams()
+        if not any(role in active_teams for role in notification["roles"]):
+            return {"status": "cancelled", "reason": "요청 팀이 테스트를 종료함"}
+        if get_rds_state() == "available" and is_app_ready():
+            send_ready_notification(notification, "✅ DEV 앱 서버 준비가 완료됐습니다.")
+            return {"status": "completed"}
+        if time.time() >= notification["deadline"]:
+            send_ready_notification(
+                notification,
+                "⚠️ DEV 앱 서버가 제한 시간 안에 준비되지 않았습니다. `/status_dev`로 상태를 확인해주세요.",
+            )
+            return {"status": "timed_out"}
+        if attempt < APP_READY_MAX_ATTEMPTS - 1:
+            time.sleep(WAIT_INTERVAL_SECONDS)
+    invoke_background_action(WAIT_FOR_APP_READY_ACTION, notification)
+    return {"status": "waiting"}
+
+
 def start_app_after_network():
     action = START_APP_AFTER_NAT_ACTION
     try:
@@ -715,6 +790,8 @@ def start_app_after_network():
 
 def handle_internal_event(event):
     action = event.get("action")
+    if action == WAIT_FOR_APP_READY_ACTION:
+        return {"action": action, **wait_for_app_ready(event["notification"])}
     if action == RECONCILE_RDS_ACTION:
         result = reconcile_rds()
         sync_reconcile_schedule()
@@ -811,7 +888,7 @@ def get_instance_status():
         return f"오류 발생: {str(e)}"
 
 
-def handle_start_dev(user_roles):
+def handle_start_dev(user_roles, notification=None):
     if not user_roles:
         return "❌ DEV 서버를 시작할 권한이 없습니다."
 
@@ -829,6 +906,12 @@ def handle_start_dev(user_roles):
             return f"❌ 활성 팀 상태 저장 오류: {str(e)}"
 
     start_msg = start_dev_stack()
+    if notification and not start_msg.startswith("❌"):
+        try:
+            invoke_background_action(WAIT_FOR_APP_READY_ACTION, notification)
+            start_msg += "\n✅ 준비가 끝나면 이 채널에서 요청자를 멘션해 알려드립니다."
+        except Exception:
+            start_msg += "\n⚠️ 준비 완료 알림을 예약하지 못했습니다. `/status_dev`로 확인해주세요."
     return f"{start_msg}\n테스트 중인 팀: {format_active_teams(active_teams)}"
 
 
@@ -1098,7 +1181,18 @@ def respond_to_deferred_command(raw_request, command_name, user_roles):
     print(f"Discord command acknowledged: {command_name}")
     try:
         if command_name == "start_dev":
-            message_content = handle_start_dev(user_roles)
+            user_id = raw_request.get("member", {}).get("user", {}).get("id")
+            channel_id = raw_request.get("channel_id")
+            notification = None
+            if user_id and channel_id:
+                notification = {
+                    "interaction_id": raw_request["id"],
+                    "user_id": user_id,
+                    "channel_id": channel_id,
+                    "roles": user_roles,
+                    "deadline": time.time() + APP_READY_TIMEOUT_SECONDS,
+                }
+            message_content = handle_start_dev(user_roles, notification)
         elif command_name == "stop_dev":
             message_content = handle_stop_dev(user_roles)
         else:

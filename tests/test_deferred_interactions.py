@@ -24,7 +24,8 @@ class DeferredInteractionsTest(unittest.TestCase):
         payload = {
             'type': 2, 'id': '123', 'application_id': '456',
             'token': 'test-interaction-token', 'data': {'name': command},
-            'member': {'roles': roles or []},
+            'channel_id': '789',
+            'member': {'roles': roles or [], 'user': {'id': '321'}},
         }
         body = json.dumps(payload).encode()
         timestamp = str(int(time.time()))
@@ -108,7 +109,11 @@ class DeferredInteractionsTest(unittest.TestCase):
             self.main, 'handle_start_dev', return_value='starting'
         ) as start:
             response = self.request('start_dev', [self.main.ROLE_MAPPING['인프라'], 'unknown-role'])
-        start.assert_called_once_with(['인프라'])
+        start.assert_called_once()
+        self.assertEqual(start.call_args.args[0], ['인프라'])
+        self.assertEqual(start.call_args.args[1]['user_id'], '321')
+        self.assertEqual(start.call_args.args[1]['channel_id'], '789')
+        self.assertEqual(start.call_args.args[1]['interaction_id'], '123')
         self.assertEqual(response.status_code, 202)
         self.assertEqual(send.call_args_list[0].args[0].full_url,
                          'https://discord.com/api/v10/interactions/123/test-interaction-token/callback')
