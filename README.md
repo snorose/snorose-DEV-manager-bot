@@ -19,6 +19,8 @@ DEV 관리자 봇의 상태를 묻는 명령어입니다.
 
 DEV 서버를 시작하는 명령어입니다.
 이미 서버가 실행 중이더라도 꼭 입력해주세요!
+RDS와 현재 앱 인스턴스의 ALB 상태 검사가 정상으로 확인되면 명령을 실행한 사람을 멘션해 알립니다.
+60분 안에 준비되지 않으면 상태 확인 안내를 보냅니다. 그 전에 해당 팀이 테스트를 종료하면 알림을 취소합니다.
 
 ### **3️⃣ `stop_dev`**
 
@@ -77,7 +79,7 @@ Discord로 전달하지 않으며, 검사 때문에 서비스를 시작·재시�
 3. 각 Environment variable에 ```AWS_ROLE_ARN```, ```AWS_REGION```, ```ECR_REPOSITORY_NAME```, ```LAMBDA_FUNCTION_NAME```, ```DISCORD_PUBLIC_KEY```, ```DISCORD_APPLICATION_ID```를 설정합니다.
    ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```, ```RDS_INSTANCE_IDENTIFIER```, ```REDIS_READINESS_DOCUMENT```, ```PENDING_RECONCILE_RULE```는 GitHub 변수에서 생략하면 배포 워크플로의 DEV 기본값이 쓰입니다.
    Lambda 환경변수는 워크플로가 맵 전체를 덮어쓰므로, 콘솔에서 직접 추가하면 다음 배포 때 사라집니다.
-4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다.
+4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다. Lambda가 준비 완료 알림을 보내므로 봇에 해당 채널의 `SEND_MESSAGES` 권한도 필요합니다.
 5. `develop` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
 6. Lambda Function URL에 ```/interactions```를 붙여 [디스코드 개발자 포털](https://discord.com/developers/applications)의 General Information > Interactions Endpoint URL에 입력합니다.
 7. 배포 뒤 Lambda 실행 역할에 아래 "필요 IAM 권한"의 정책을 부여합니다.
@@ -136,6 +138,7 @@ DEV가 정지되어 있는 동안 WARP를 통한 DB 접근도 중단됩니다. �
 중복되면 제어 대상을 임의로 선택하지 않습니다.
 대기 작업은 같은 Lambda를 비동기로 호출해 처리하므로 Discord interaction 응답을 막지 않습니다.
 Lambda timeout은 배포 워크플로에서 600초로 설정합니다.
+준비 완료 알림은 RDS가 `available`이고 현재 ASG 인스턴스가 ALB Target Group에서 `healthy`가 되면 전송합니다.
 
 Lambda 실행 역할에 필요한 권한은 `iam/lambda-execution-policy.json`에 정리되어 있습니다.
 
