@@ -108,7 +108,9 @@
       "Action": "ssm:SendCommand",
       "Resource": "arn:aws:ec2:ap-northeast-2:621962613485:instance/*",
       "Condition": {
-        "StringEquals": { "ssm:resourceTag/Name": "snorose-dev" }
+        "StringEquals": {
+          "ssm:resourceTag/Name": "snorose-dev"
+        }
       }
     },
     {
@@ -147,7 +149,10 @@
     {
       "Sid": "TogglePendingDevReconcile",
       "Effect": "Allow",
-      "Action": ["events:EnableRule", "events:DisableRule"],
+      "Action": [
+        "events:EnableRule",
+        "events:DisableRule"
+      ],
       "Resource": "arn:aws:events:ap-northeast-2:621962613485:rule/snorose-dev-manager-bot-rds-pending"
     },
     {
@@ -158,6 +163,12 @@
         "s3:PutObject"
       ],
       "Resource": "arn:aws:s3:::snorose-dev-bucket/dev-manager/startup-lock.json"
+    },
+    {
+      "Sid": "ReadManagerBotDiscordToken",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:ap-northeast-2:<ACCOUNT_ID>:parameter/snorose/dev/manager-bot/discord-bot-token"
     }
   ]
 }
