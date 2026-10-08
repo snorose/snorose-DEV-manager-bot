@@ -27,12 +27,7 @@ PENDING_RECONCILE_RULE = os.environ.get("PENDING_RECONCILE_RULE")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
 
 DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY")
-# 봇 토큰은 환경 변수가 아니라 실행 시 SSM SecureString에서 읽는다. 값은 Lambda
-# 설정·Terraform state·배포 로그에 남지 않는다. 테스트는 DISCORD_BOT_TOKEN을 직접 지정한다.
-DISCORD_BOT_TOKEN_PARAMETER = os.environ.get(
-    "DISCORD_BOT_TOKEN_PARAMETER", "/snorose/dev/manager-bot/discord-bot-token"
-)
-DISCORD_BOT_TOKEN = None
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 ACTIVE_TEAMS_BUCKET = os.environ.get("ACTIVE_TEAMS_BUCKET", "snorose-dev-bucket")
 ACTIVE_TEAMS_KEY = os.environ.get("ACTIVE_TEAMS_KEY", "dev-manager/active-teams.json")
 DEPLOYMENTS_PREFIX = "dev-manager/deployments/"
@@ -710,28 +705,9 @@ def is_app_ready():
     )
 
 
-def discord_bot_token():
-    """SSM에서 봇 토큰을 한 번 읽어 실행 환경 안에서만 재사용한다."""
-    global DISCORD_BOT_TOKEN
-    if DISCORD_BOT_TOKEN:
-        return DISCORD_BOT_TOKEN
-    import boto3
-
-    try:
-        response = boto3.client("ssm", region_name=AWS_REGION).get_parameter(
-            Name=DISCORD_BOT_TOKEN_PARAMETER, WithDecryption=True
-        )
-    except Exception:
-        raise RuntimeError(f"봇 토큰 파라미터를 읽지 못했습니다: {DISCORD_BOT_TOKEN_PARAMETER}") from None
-    token = response.get("Parameter", {}).get("Value")
-    if not token:
-        raise RuntimeError(f"봇 토큰 파라미터가 비어 있습니다: {DISCORD_BOT_TOKEN_PARAMETER}")
-    DISCORD_BOT_TOKEN = token
-    return token
-
-
 def send_ready_notification(notification, content):
-    token = discord_bot_token()
+    if not DISCORD_BOT_TOKEN:
+        raise RuntimeError("DISCORD_BOT_TOKEN 환경변수를 찾을 수 없습니다.")
     user_id = notification["user_id"]
     payload = {
         "content": f"<@{user_id}> {content}",
@@ -744,7 +720,7 @@ def send_ready_notification(notification, content):
         f"https://discord.com/api/v10/channels/{channel_id}/messages",
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bot {token}",
+            "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
             "Content-Type": "application/json",
             "User-Agent": "SnoroseDevManagerBot/1.0",
         },
