@@ -61,7 +61,7 @@ Discord로 전달하지 않으며, 검사 때문에 서비스를 시작·재시�
 1. ```pip install -r src/requirements.txt```와 ```pip install -r commands/requirements.txt```를 실행해 라이브러리를 설치합니다.
 2. [Discord Developer Portal](https://discord.com/developers/applications)에서 봇을 생성하고 테스트할 서버에 초대합니다.
 3. 생성한 디스코드 봇의 Application ID, Public Key, Token을 메모해 둡니다.
-4. ```DISCORD_BOT_TOKEN```, ```DISCORD_APPLICATION_ID```, ```DISCORD_PUBLIC_KEY``` 환경변수를 메모한 값으로 설정합니다.
+4. ```DISCORD_APPLICATION_ID```, ```DISCORD_PUBLIC_KEY``` 환경변수를 메모한 값으로 설정합니다. 봇 토큰은 Lambda 환경변수가 아니라 SSM SecureString ```/snorose/dev/manager-bot/discord-bot-token```에 넣고, 필요하면 ```DISCORD_BOT_TOKEN_PARAMETER```로 이름을 바꿉니다. 로컬에서 명령을 등록할 때만 ```DISCORD_BOT_TOKEN``` 환경변수를 씁니다.
 5. 로컬에서는 ```src/app/main.py``` 파일의 ```DISCORD_PUBLIC_KEY``` 값을 직접 바꾸지 말고 환경변수로 주입합니다.
 6. [ngrok 설치 페이지](https://ngrok.com/downloads/windows)로 이동하여 운영 체제에 맞는 ngrok를 설치한 뒤 로그인을 진행합니다.
 7. 로그인이 완료되면 Getting Started > Your Authtoken에서 Authtoken을 복사합니다.
@@ -79,7 +79,7 @@ Discord로 전달하지 않으며, 검사 때문에 서비스를 시작·재시�
 3. 각 Environment variable에 ```AWS_ROLE_ARN```, ```AWS_REGION```, ```ECR_REPOSITORY_NAME```, ```LAMBDA_FUNCTION_NAME```, ```DISCORD_PUBLIC_KEY```, ```DISCORD_APPLICATION_ID```를 설정합니다.
    ```ACTIVE_TEAMS_BUCKET```, ```ACTIVE_TEAMS_KEY```, ```ASG_NAME```, ```FCK_NAT_NAME```, ```RDS_INSTANCE_IDENTIFIER```, ```REDIS_READINESS_DOCUMENT```, ```PENDING_RECONCILE_RULE```는 GitHub 변수에서 생략하면 배포 워크플로의 DEV 기본값이 쓰입니다.
    Lambda 환경변수는 워크플로가 맵 전체를 덮어쓰므로, 콘솔에서 직접 추가하면 다음 배포 때 사라집니다.
-4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다. Lambda가 준비 완료 알림을 보내므로 봇에 해당 채널의 `SEND_MESSAGES` 권한도 필요합니다.
+4. 각 Environment secret에 ```DISCORD_BOT_TOKEN```을 설정합니다. 이 값은 slash command 등록에만 쓰이고 Lambda 환경변수로는 넣지 않습니다. Lambda 환경변수는 인프라 저장소의 Terraform이 소유하며, 봇은 실행 시 SSM SecureString에서 토큰을 읽습니다. Lambda가 준비 완료 알림을 보내므로 봇에 해당 채널의 `SEND_MESSAGES` 권한도 필요하고, 실행 역할에는 해당 파라미터의 `ssm:GetParameter` 권한이 필요합니다.
 5. `develop` 브랜치에 push하면 GitHub Actions가 이미지를 배포하고 Discord slash command를 등록합니다.
 6. Lambda Function URL에 ```/interactions```를 붙여 [디스코드 개발자 포털](https://discord.com/developers/applications)의 General Information > Interactions Endpoint URL에 입력합니다.
 7. 배포 뒤 Lambda 실행 역할에 아래 "필요 IAM 권한"의 정책을 부여합니다.
